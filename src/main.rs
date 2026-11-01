@@ -19,6 +19,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -32,6 +33,7 @@ const MENU_MINIMAL: usize = 2;
 const MENU_EXIT: usize = 3;
 const MENU_GLASS: usize = 4;
 const MENU_OVERLAY: usize = 5;
+const MENU_FULLSCREEN: usize = 6;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Bottom edge of the area (physical px) where cursor moves should wake the loop.
@@ -138,6 +140,8 @@ fn main() -> Result<()> {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         with_app(|a| a.welcome(false));
+        // Whenever another window comes to the front, make sure we're still above it.
+        let _ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         // Frame loop: while something moves, every frame is presented with vsync (which
         // also paces the loop); when still, sleep until input or a short poll interval.
@@ -212,6 +216,7 @@ fn tray_menu(hwnd: HWND) {
     let minimal = with_app(|a| a.minimal()).unwrap_or(false);
     let glass = with_app(|a| a.glass()).unwrap_or(false);
     let overlay = with_app(|a| a.overlay_shown()).unwrap_or(false);
+    let fullscreen = with_app(|a| a.hide_in_fullscreen()).unwrap_or(true);
     let start = win::starts_with_windows();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
@@ -220,6 +225,7 @@ fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(glass), MENU_GLASS, w!("Liquid Glass"));
         let _ = AppendMenuW(menu, check(minimal), MENU_MINIMAL, w!("Minimal notch"));
         let _ = AppendMenuW(menu, check(overlay), MENU_OVERLAY, w!("FPS overlay"));
+        let _ = AppendMenuW(menu, check(fullscreen), MENU_FULLSCREEN, w!("Hide in full screen"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
         let mut p = POINT::default();
@@ -237,6 +243,9 @@ fn tray_menu(hwnd: HWND) {
             }
             MENU_OVERLAY => {
                 with_app(|a| a.set_overlay(!overlay));
+            }
+            MENU_FULLSCREEN => {
+                with_app(|a| a.set_hide_in_fullscreen(!fullscreen));
             }
             MENU_EXIT => {
                 let _ = DestroyWindow(hwnd);
@@ -347,4 +356,9 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Foreground-window changes (delivered on our thread through the message loop).
+unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+    with_app(|a| a.keep_on_top());
 }

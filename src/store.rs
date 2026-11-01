@@ -132,11 +132,13 @@ pub struct Settings {
     /// The FPS overlay is pinned on screen, and where (top-left, physical px).
     pub overlay: bool,
     pub overlay_pos: Option<(i32, i32)>,
+    /// Step the notch aside while a full-screen app is in front.
+    pub hide_in_fullscreen: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { minimal: false, glass: true, overlay: false, overlay_pos: None }
+        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true }
     }
 }
 

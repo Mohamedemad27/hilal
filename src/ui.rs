@@ -330,6 +330,10 @@ pub struct App {
     region: [i32; 4],
     /// When the welcome started, and whether it's a "welcome back".
     welcome_at: Option<(Instant, bool)>,
+    /// Last time the windows were put back on top, and whether the notch is stepped
+    /// aside for a full-screen app.
+    top_check: Instant,
+    hidden_for_fullscreen: bool,
     stats: Stats,
     frame_start: Instant,
     backdrop_retry: Instant,
@@ -427,6 +431,8 @@ impl App {
             closed_sig: String::new(),
             region: [0; 4],
             welcome_at: None,
+            top_check: now,
+            hidden_for_fullscreen: false,
             stats: Stats::new(now),
             frame_start: now,
             backdrop_retry: now - Duration::from_secs(10),
@@ -446,6 +452,39 @@ impl App {
     pub fn set_minimal(&mut self, on: bool) {
         self.store.settings.minimal = on;
         self.store.save();
+    }
+
+    pub fn hide_in_fullscreen(&self) -> bool {
+        self.store.settings.hide_in_fullscreen
+    }
+
+    pub fn set_hide_in_fullscreen(&mut self, on: bool) {
+        self.store.settings.hide_in_fullscreen = on;
+        self.store.save();
+        self.keep_on_top();
+    }
+
+    /// Windows sometimes drops a topmost window out of the topmost band (Show desktop,
+    /// other always-on-top apps), leaving it under ordinary windows. Called when the
+    /// foreground window changes and every couple of seconds: puts the notch and the
+    /// overlay back on top, and steps the notch aside while a full-screen app (a game,
+    /// a video) is in front. The FPS overlay stays, since that's where it's wanted.
+    pub fn keep_on_top(&mut self) {
+        self.top_check = Instant::now();
+        let fullscreen = self.store.settings.hide_in_fullscreen && foreground_is_fullscreen(&[self.hwnd, self.overlay.hwnd]);
+        unsafe {
+            if fullscreen != self.hidden_for_fullscreen {
+                self.hidden_for_fullscreen = fullscreen;
+                let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            }
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+            if !fullscreen {
+                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+            if self.store.settings.overlay {
+                let _ = SetWindowPos(self.overlay.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+        }
     }
 
     /// One pass of the frame loop: polls everything and redraws if needed. Returns how
@@ -554,6 +593,9 @@ impl App {
             self.draw_overlay();
         }
         self.update_region();
+        if self.top_check.elapsed() > Duration::from_secs(2) {
+            self.keep_on_top();
+        }
         self.log_screen();
         if busy { 0 } else { 120 }
     }
@@ -2142,5 +2184,34 @@ mod tests {
         assert_eq!(f("09301000").time_value(), "09:30-10:00");
         assert_eq!(f("2561").time_value(), "");
         assert_eq!(f("09").mask(), "09:__-__:__");
+    }
+}
+
+/// True when the foreground window covers its whole monitor (a game, a full-screen video
+/// or slideshow). Maximized windows leave the taskbar visible, so they don't count; nor do
+/// the desktop or our own windows.
+fn foreground_is_fullscreen(ours: &[HWND]) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || ours.contains(&fg) {
+            return false;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(fg, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(fg, &mut r).is_err() {
+            return false;
+        }
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
     }
 }

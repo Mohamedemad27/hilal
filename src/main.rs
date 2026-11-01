@@ -3,6 +3,9 @@
 mod gfx;
 mod lyrics;
 mod media;
+mod meter;
+mod claude;
+mod claude_app;
 mod download;
 mod prayer;
 mod shell;
@@ -176,9 +179,33 @@ fn main() -> Result<()> {
             instance,
             None,
         )?;
+        // The Claude session popup: same kind of window, opened from the Claude page.
+        let popup_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(popup_proc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("HilalPopup"),
+            ..Default::default()
+        };
+        RegisterClassExW(&popup_class);
+        let popup = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("HilalPopup"),
+            w!("Hilal Claude"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            instance,
+            None,
+        )?;
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let overlay_default = (screen_w - ((OV_W + 24.0) * scale) as i32, (WIN_H * scale) as i32);
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, gfx, origin, overlay, overlay_default)));
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, gfx, origin, overlay, overlay_default, popup)));
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         WAKE_ZONE.store((WIN_H * scale) as i32 + 40, Ordering::Relaxed);
         start_mouse_hook();
@@ -482,6 +509,46 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             return LRESULT(0);
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// The Claude session popup: drag it by its header, close it with its button.
+extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => {
+            let (sx, sy) = ((lparam.0 & 0xffff) as i16 as i32, ((lparam.0 >> 16) & 0xffff) as i16 as i32);
+            let drag = with_app(|a| a.popup_drags(sx, sy)).unwrap_or(false);
+            return LRESULT(if drag { HTCAPTION } else { HTCLIENT } as isize);
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = dp(hwnd, lparam);
+            with_app(|a| a.popup_click(x, y));
+            return LRESULT(0);
+        }
+        WM_EXITSIZEMOVE => {
+            with_app(|a| a.popup_moved());
+            return LRESULT(0);
+        }
+        // Typing a message needs the keyboard; otherwise it never takes focus.
+        WM_MOUSEACTIVATE => {
+            let typing = with_app(|a| a.popup_typing()).unwrap_or(false);
+            return LRESULT(if typing { MA_ACTIVATE } else { MA_NOACTIVATE } as isize);
+        }
+        WM_KEYDOWN => {
+            with_app(|a| a.popup_key(wparam.0 as u16));
+            return LRESULT(0);
+        }
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wparam.0 as u32) {
+                with_app(|a| a.popup_char(c));
+            }
+            return LRESULT(0);
+        }
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|a| a.popup_focus(false));
+        }
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

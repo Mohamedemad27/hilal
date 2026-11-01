@@ -17,6 +17,7 @@ use crate::gfx::{self, rgb, rgba, white, Align, Color, Gfx, Image, Rect, BLACK, 
 use crate::lyrics::{self, Lyrics};
 use crate::media::{Command, Media, Track};
 use crate::download::{self, Kind, Phase};
+use crate::claude::{self, Session};
 use crate::prayer;
 use crate::store::{self, Store, Task};
 use crate::sysmon::{Snapshot, Sysmon};
@@ -34,6 +35,8 @@ const RED: Color = rgb(0xff, 0x4b, 0x55);
 const BATTERY: Color = rgb(0x33, 0xe0, 0x7a);
 const VIOLET: Color = rgb(0xa8, 0x7b, 0xff);
 const AMBER: Color = rgb(0xff, 0xc4, 0x3d);
+/// Claude's own coral.
+const CLAUDE: Color = rgb(0xd9, 0x77, 0x57);
 
 /// How long the notch stays open after the cursor leaves it.
 /// Pill buttons: label size, and the room on each side of their content.
@@ -148,13 +151,14 @@ enum Page {
     Water,
     Prayer,
     Download,
+    Claude,
     Shelf,
     Todo,
     System,
 }
 
-const PAGES: [Page; 8] =
-    [Page::Music, Page::Pomo, Page::Water, Page::Prayer, Page::Download, Page::Shelf, Page::Todo, Page::System];
+const PAGES: [Page; 9] =
+    [Page::Music, Page::Pomo, Page::Water, Page::Prayer, Page::Download, Page::Claude, Page::Shelf, Page::Todo, Page::System];
 
 impl Page {
     fn index(self) -> usize {
@@ -194,6 +198,8 @@ enum Action {
     DlCancel,
     /// Show the saved file in Explorer.
     DlShow,
+    /// Open the popup for the n-th session in the list.
+    ClaudeOpen(usize),
     WaterRefilled,
     WaterDrank,
     Goal(u32),
@@ -313,6 +319,16 @@ pub struct App {
     store: Store,
     media: Media,
     sysmon: Sysmon,
+    popup: Popup,
+    /// Claude Code's recent sessions, re-read from the background reader twice a second.
+    sessions: claude::Sessions,
+    claude_list: Vec<Session>,
+    claude_at: Instant,
+    claude_scroll: usize,
+    /// What's playing, as live levels for the closed notch's bars.
+    meter: crate::meter::Meter,
+    /// The bars as drawn: they leap up with the sound and settle back.
+    bar_levels: Cell<[f32; crate::meter::BANDS]>,
     stats_now: Snapshot,
     /// Start of the current on-screen FPS window: (time, screen frames counted so far).
     fps_window: (Instant, u64),
@@ -415,6 +431,49 @@ struct Overlay {
     last: Instant,
 }
 
+pub const PP_W: f32 = 440.0;
+pub const PP_H: f32 = 400.0;
+
+/// The Claude session popup.
+struct Popup {
+    hwnd: HWND,
+    surface: usize,
+    /// Top-left on the desktop, physical px.
+    pos: (i32, i32),
+    /// The session it shows (by id), while open.
+    session: Option<String>,
+    /// The cursor over it, in dp.
+    hover: Option<(f32, f32)>,
+    last: Instant,
+    dumped: bool,
+    /// Pinned, it stays open when the mouse leaves.
+    pinned: bool,
+    /// When the mouse left the notch and the popup (it closes a moment later).
+    away_at: Option<Instant>,
+    /// The message being written, and whether the box has the keyboard.
+    draft: String,
+    typing: bool,
+    /// What became of the last send (text, when, whether it worked).
+    note: Option<(String, Instant, bool)>,
+}
+
+fn popup_close_rect() -> Rect {
+    Rect::centered(PP_W - 26.0, 26.0, 26.0, 26.0)
+}
+
+fn popup_pin_rect() -> Rect {
+    Rect::centered(PP_W - 58.0, 26.0, 26.0, 26.0)
+}
+
+fn popup_field_rect() -> Rect {
+    Rect::new(14.0, PP_H - 50.0, PP_W - 28.0, 36.0)
+}
+
+fn popup_send_rect() -> Rect {
+    let f = popup_field_rect();
+    Rect::centered(f.x + f.w - 18.0, f.y + f.h / 2.0, 28.0, 28.0)
+}
+
 fn overlay_close_rect() -> Rect {
     Rect::centered(OV_W - 15.0, 15.0, 18.0, 18.0)
 }
@@ -422,7 +481,7 @@ fn overlay_close_rect() -> Rect {
 impl App {
     /// `overlay_hwnd` is the (hidden) FPS overlay window; `overlay_default` is where it
     /// goes the first time (physical px).
-    pub fn new(hwnd: HWND, mut gfx: Gfx, origin: POINT, overlay_hwnd: HWND, overlay_default: (i32, i32)) -> Self {
+    pub fn new(hwnd: HWND, mut gfx: Gfx, origin: POINT, overlay_hwnd: HWND, overlay_default: (i32, i32), popup_hwnd: HWND) -> Self {
         let mut store = Store::load();
         if store.water.roll_day() {
             store.save();
@@ -444,9 +503,24 @@ impl App {
             let rgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, (OV_W * k) as i32 + 1, (OV_H * k) as i32 + 1, d, d);
             SetWindowRgn(overlay_hwnd, rgn, false);
         }
+        // The popup sits under the open notch, centered.
+        let popup_pos = (origin.x + ((WIN_W - PP_W) / 2.0 * k) as i32, origin.y + (150.0 * k) as i32);
+        let popup_surface = gfx.add_surface(popup_hwnd, PP_W, PP_H, popup_pos, false).unwrap_or(gfx::MAIN);
+        unsafe {
+            let _ = SetWindowPos(popup_hwnd, HWND_TOPMOST, popup_pos.0, popup_pos.1, (PP_W * k) as i32, (PP_H * k) as i32, SWP_NOACTIVATE);
+            let d = (52.0 * k) as i32;
+            let rgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, (PP_W * k) as i32 + 1, (PP_H * k) as i32 + 1, d, d);
+            SetWindowRgn(popup_hwnd, rgn, false);
+        }
         win::exclude_from_capture(hwnd, store.settings.glass);
         win::exclude_from_capture(overlay_hwnd, store.settings.glass);
+        win::exclude_from_capture(popup_hwnd, store.settings.glass);
         Self {
+            popup: Popup { hwnd: popup_hwnd, surface: popup_surface, pos: popup_pos, session: None, hover: None, last: now, dumped: false, pinned: false, away_at: None, draft: String::new(), typing: false, note: None },
+            sessions: claude::Sessions::start(),
+            claude_list: Vec::new(),
+            claude_at: now,
+            claude_scroll: 0,
             overlay: Overlay { hwnd: overlay_hwnd, surface, pos: overlay_pos, hover: false, dirty: true, dumps: 0, last: now },
             hwnd,
             gfx,
@@ -454,6 +528,8 @@ impl App {
             store,
             media: Media::start(),
             sysmon: Sysmon::start(),
+            meter: crate::meter::Meter::new(),
+            bar_levels: Cell::new([0.0; crate::meter::BANDS]),
             stats_now: Snapshot::default(),
             fps_window: (now, 0),
             screen_log: (now, 0),
@@ -532,6 +608,7 @@ impl App {
         let now = Instant::now();
         win::exclude_from_capture(self.hwnd, false);
         win::exclude_from_capture(self.overlay.hwnd, false);
+        win::exclude_from_capture(self.popup.hwnd, false);
         // CAPTURE_HIDDEN tracks the "hidden" state; we're only visible for a moment.
         win::CAPTURE_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
         self.capture_until = Some(now + Duration::from_secs(6));
@@ -555,7 +632,7 @@ impl App {
     /// a video) is in front. The FPS overlay stays, since that's where it's wanted.
     pub fn keep_on_top(&mut self) {
         self.top_check = Instant::now();
-        let fullscreen = self.store.settings.hide_in_fullscreen && foreground_is_fullscreen(&[self.hwnd, self.overlay.hwnd]);
+        let fullscreen = self.store.settings.hide_in_fullscreen && foreground_is_fullscreen(&[self.hwnd, self.overlay.hwnd, self.popup.hwnd]);
         unsafe {
             if fullscreen != self.hidden_for_fullscreen {
                 self.hidden_for_fullscreen = fullscreen;
@@ -567,6 +644,9 @@ impl App {
             }
             if self.store.settings.overlay {
                 let _ = SetWindowPos(self.overlay.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+            if self.popup.session.is_some() {
+                let _ = SetWindowPos(self.popup.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
             }
         }
     }
@@ -674,6 +754,7 @@ impl App {
             if self.store.settings.glass {
                 win::exclude_from_capture(self.hwnd, true);
                 win::exclude_from_capture(self.overlay.hwnd, true);
+                win::exclude_from_capture(self.popup.hwnd, true);
             }
         }
 
@@ -696,6 +777,7 @@ impl App {
         let overlay_on = self.store.settings.overlay;
         let on_system = self.open && self.page == Page::System;
         self.sysmon.set_active(on_system || overlay_on);
+        self.meter.set_active(self.track.as_ref().is_some_and(|t| t.playing));
         if on_system || overlay_on {
             self.stats_now = self.sysmon.get();
             if self.sample_fps() {
@@ -718,6 +800,27 @@ impl App {
             self.closed_sig = sig;
             self.request_dump(animating);
             self.draw();
+        }
+        // Claude's sessions: the list refreshes twice a second; the popup redraws at 30 fps
+        // while open (its spinners turn), noting where the cursor is over it.
+        if self.claude_at.elapsed() > Duration::from_millis(500) {
+            self.claude_at = now;
+            self.claude_list = self.sessions.list();
+        }
+        if self.popup.session.is_some() && self.popup.last.elapsed() >= Duration::from_millis(33) {
+            let k = self.gfx.scale;
+            self.popup.hover = win::cursor_px()
+                .map(|(x, y)| ((x - self.popup.pos.0) as f32 / k, (y - self.popup.pos.1) as f32 / k))
+                .filter(|&(x, y)| x >= 0.0 && y >= 0.0 && x < PP_W && y < PP_H);
+            self.draw_popup();
+            // Unpinned and untouched, it follows the notch: once the mouse has left both
+            // for a moment, it closes.
+            let p = &self.popup;
+            if p.pinned || p.typing || !p.draft.is_empty() || p.hover.is_some() || self.inside {
+                self.popup.away_at = None;
+            } else if self.popup.away_at.get_or_insert(now).elapsed() > Duration::from_millis(450) {
+                self.close_popup();
+            }
         }
         // The overlay's numbers change twice a second; its glass at most 30 times a second.
         if overlay_on && self.overlay.dirty && self.overlay.last.elapsed() >= Duration::from_millis(33) {
@@ -940,7 +1043,7 @@ impl App {
             }
             format!("mid-{}x{}", t.w as i32, t.h as i32)
         } else {
-            let page = ["music", "pomo", "water", "prayer", "download", "shelf", "todo", "system"][self.page.index()];
+            let page = ["music", "pomo", "water", "prayer", "download", "claude", "shelf", "todo", "system"][self.page.index()];
             let what = if !self.open {
                 if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else { "closed".to_owned() }
             } else if self.page == Page::Water && self.water_settings {
@@ -994,6 +1097,7 @@ impl App {
         // that capture; plain ones can show up in screenshots again.
         win::exclude_from_capture(self.hwnd, on);
         win::exclude_from_capture(self.overlay.hwnd, on);
+        win::exclude_from_capture(self.popup.hwnd, on);
         self.backdrop_retry = Instant::now() - Duration::from_secs(10);
         self.closed_sig.clear();
         self.overlay.dirty = true;
@@ -1188,6 +1292,11 @@ impl App {
             self.todo_scroll = if down { (self.todo_scroll + 1).min(max) } else { self.todo_scroll.saturating_sub(1) };
             return;
         }
+        if self.page == Page::Claude && y > 30.0 && self.claude_list.len() > 3 {
+            let max = self.claude_list.len() - 3;
+            self.claude_scroll = if down { (self.claude_scroll + 1).min(max) } else { self.claude_scroll.saturating_sub(1) };
+            return;
+        }
         // Scrolling over the city pill steps through the cities.
         if self.page == Page::Prayer && lx < 198.0 && y > 90.0 && y < 126.0 {
             self.perform(Action::PrayerCity(if down { 1 } else { -1 }), 0.0);
@@ -1334,6 +1443,13 @@ impl App {
             }
             DlCancel => {
                 self.dl_job = None;
+                save = false;
+            }
+            ClaudeOpen(i) => {
+                if let Some(s) = self.claude_list.get(i) {
+                    let id = s.id.clone();
+                    self.open_popup(id);
+                }
                 save = false;
             }
             DlShow => {
@@ -1719,6 +1835,7 @@ impl App {
             Page::Water => self.water_page(),
             Page::Prayer => self.prayer_page(),
             Page::Download => self.download_page(),
+            Page::Claude => self.claude_page(),
             Page::Shelf => self.shelf_page(),
             Page::Todo => self.todo_page(),
             Page::System => self.system_page(),
@@ -1878,12 +1995,19 @@ impl App {
         let cy = s.h / 2.0;
         let line = self.closed_lyric();
         if let Some(t) = self.track.as_ref().filter(|t| t.playing) {
+            let lv = self.bar_levels();
+            // The bass makes the cover glow in its own color and swell a touch.
+            let bass = lv[0];
+            let accent = self.art().map_or(WHITE, |(_, c)| *c);
+            g.radial(x0 + 20.0, cy, 18.0 + 6.0 * bass, 16.0 + 4.0 * bass, [accent[0], accent[1], accent[2], 0.10 + 0.40 * bass]);
+            let side = 20.0 * (1.0 + 0.07 * bass);
+            let art = Rect::centered(x0 + 20.0, cy, side, side);
             if let Some((img, _)) = self.art() {
-                g.draw_image(img, Rect::new(x0 + 10.0, cy - 10.0, 20.0, 20.0), 5.0, 1.0);
+                g.draw_image(img, art, 5.0, 1.0);
             } else {
-                g.fill_rrect(Rect::new(x0 + 10.0, cy - 10.0, 20.0, 20.0), 5.0, white(0.15));
+                g.fill_rrect(art, 5.0, white(0.15));
             }
-            self.bars(x0 + s.w - 30.0, cy);
+            self.bars(x0 + s.w - 31.0, cy, &lv, accent);
             if let Some(line) = line {
                 g.text(&line, x0 + 38.0, cy, s.w - 76.0, 13.0, 600, WHITE, Align::Center);
             } else if s.w > IDLE.w + 20.0 {
@@ -1901,12 +2025,35 @@ impl App {
         }
     }
 
-    fn bars(&self, x: f32, cy: f32) {
+    /// The bars' levels this frame: they follow the live sound (quick up, eased down), or
+    /// breathe gently when no sound comes through (a muted tab, say).
+    fn bar_levels(&self) -> [f32; crate::meter::BANDS] {
+        let dt = self.last_draw.get().elapsed().as_secs_f32().min(0.1);
         let t = self.t0.elapsed().as_secs_f32();
-        for i in 0..5 {
-            let k = 0.5 + 0.5 * (t * 7.0 + i as f32 * 1.3).sin() * (t * 3.1 + i as f32).cos();
-            let h = 14.0 * (0.3 + 0.7 * k);
-            self.gfx.fill_rrect(Rect::new(x + i as f32 * 4.2, cy - h / 2.0, 2.2, h), 1.1, WHITE);
+        let target: [f32; crate::meter::BANDS] = self.meter.levels().unwrap_or_else(|| {
+            std::array::from_fn(|i| 0.25 + 0.12 * (t * 2.2 + i as f32 * 0.9).sin())
+        });
+        let mut shown = self.bar_levels.get();
+        for (v, tv) in shown.iter_mut().zip(target) {
+            let rate = if tv > *v { 28.0 } else { 7.0 };
+            *v += (tv - *v) * (1.0 - (-dt * rate).exp());
+        }
+        self.bar_levels.set(shown);
+        shown
+    }
+
+    /// Five bars in the cover's color, bass in the middle and the highs to the sides.
+    fn bars(&self, x: f32, cy: f32, lv: &[f32; crate::meter::BANDS], c: Color) {
+        let g = &self.gfx;
+        const ORDER: [usize; 5] = [3, 1, 0, 2, 4];
+        for (slot, &band) in ORDER.iter().enumerate() {
+            let k = lv[band].clamp(0.0, 1.0);
+            let h = 3.0 + 13.0 * k;
+            let r = Rect::new(x + slot as f32 * 4.4, cy - h / 2.0, 2.6, h);
+            // Lighter at the tips, full color at the middle; louder bars glow brighter.
+            let top = [c[0] + (1.0 - c[0]) * 0.55, c[1] + (1.0 - c[1]) * 0.55, c[2] + (1.0 - c[2]) * 0.55, 0.75 + 0.25 * k];
+            let mid = [c[0], c[1], c[2], 0.75 + 0.25 * k];
+            g.linear(r, 1.3, &[(0.0, top), (0.5, mid), (1.0, top)], true);
         }
     }
 
@@ -2384,6 +2531,322 @@ impl App {
         }
     }
 
+    // ----- Claude Code ------------------------------------------------------------------
+
+    fn claude_page(&self) {
+        let g = &self.gfx;
+        self.header("Claude ", Some(("Code", CLAUDE)));
+        let list = &self.claude_list;
+        let working = list.iter().filter(|s| s.state == claude::State::Working).count();
+        if working > 0 {
+            let label = format!("{working} working");
+            g.text(&label, 300.0, 19.0, 84.0, 10.5, 600, CLAUDE, Align::End);
+        }
+        if list.is_empty() {
+            spark(g, 210.0, 66.0, 13.0, white(0.3), 0.0);
+            g.text("No Claude Code sessions in the last 3 days", 44.0, 96.0, 340.0, 11.0, 400, white(0.45), Align::Center);
+            return;
+        }
+        let t = self.t0.elapsed().as_secs_f32();
+        let first = self.claude_scroll.min(list.len().saturating_sub(3));
+        for (row, (i, s)) in list.iter().enumerate().skip(first).take(3).enumerate() {
+            let r = Rect::new(44.0, 33.0 + row as f32 * 31.0, 340.0, 27.0);
+            let open = self.popup.session.as_deref() == Some(s.id.as_str());
+            let fill = if open { rgba(0xd9, 0x77, 0x57, 0.22) } else if self.hovered(r) { white(0.11) } else { white(0.06) };
+            g.fill_rrect(r, 9.0, fill);
+            let cy = r.y + r.h / 2.0;
+            status_icon(g, s.state, r.x + 14.0, cy, t);
+            let (done, total) = s.tasks_done();
+            let right = if total > 0 { format!("{done}/{total}  ·  {}", claude::ago(s.age())) } else { claude::ago(s.age()) };
+            let rw = g.measure(&right, 10.0, 500);
+            g.text(&right, r.x + r.w - 22.0 - rw, cy, rw + 2.0, 10.0, 500, white(0.5), Align::Start);
+            g.icon('\u{E76C}', r.x + r.w - 11.0, cy + 0.5, 8.0, white(0.4));
+            g.text(&s.title, r.x + 28.0, cy, r.w - 60.0 - rw, 11.5, 600, WHITE, Align::Start);
+            self.hit(r, Action::ClaudeOpen(i));
+        }
+        if list.len() > 3 {
+            // Where the three rows sit in the whole list.
+            let h = 90.0 * 3.0 / list.len() as f32;
+            let y = 33.0 + (90.0 - h) * first as f32 / (list.len() - 3) as f32;
+            g.fill_rrect(Rect::new(388.0, y, 2.5, h), 1.25, white(0.25));
+        }
+    }
+
+    fn open_popup(&mut self, id: String) {
+        self.popup.session = Some(id);
+        unsafe {
+            let _ = ShowWindow(self.popup.hwnd, SW_SHOWNOACTIVATE);
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = SetWindowPos(self.popup.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+        self.gfx.move_surface(self.popup.surface, self.popup.pos);
+        self.draw_popup();
+    }
+
+    pub fn close_popup(&mut self) {
+        self.popup_focus(false);
+        self.popup.away_at = None;
+        self.popup.session = None;
+        unsafe {
+            let _ = ShowWindow(self.popup.hwnd, SW_HIDE);
+        }
+    }
+
+    /// Whether a screen point (physical px) on the popup should drag it: its header,
+    /// except the close button.
+    pub fn popup_drags(&self, x: i32, y: i32) -> bool {
+        let k = self.gfx.scale;
+        let (lx, ly) = ((x - self.popup.pos.0) as f32 / k, (y - self.popup.pos.1) as f32 / k);
+        ly < 58.0 && !popup_close_rect().grow(4.0).contains(lx, ly) && !popup_pin_rect().grow(4.0).contains(lx, ly)
+    }
+
+    pub fn popup_click(&mut self, x: f32, y: f32) {
+        if popup_close_rect().grow(4.0).contains(x, y) {
+            self.close_popup();
+        } else if popup_pin_rect().grow(4.0).contains(x, y) {
+            self.popup.pinned = !self.popup.pinned;
+        } else if popup_send_rect().grow(2.0).contains(x, y) {
+            self.popup_send();
+        } else if popup_field_rect().contains(x, y) {
+            self.popup_focus(true);
+        } else {
+            self.popup_focus(false);
+        }
+    }
+
+    pub fn popup_typing(&self) -> bool {
+        self.popup.typing
+    }
+
+    /// Gives the message box the keyboard (the popup becomes a normal, focusable window
+    /// for that), or takes it back.
+    pub fn popup_focus(&mut self, on: bool) {
+        if self.popup.typing == on {
+            return;
+        }
+        self.popup.typing = on;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.popup.hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_NOACTIVATE.0 as isize;
+            SetWindowLongPtrW(self.popup.hwnd, GWL_EXSTYLE, if on { ex & !flag } else { ex | flag });
+            if on {
+                let _ = SetForegroundWindow(self.popup.hwnd);
+                let _ = SetFocus(self.popup.hwnd);
+            }
+        }
+    }
+
+    pub fn popup_key(&mut self, vk: u16) {
+        match vk {
+            0x08 => {
+                self.popup.draft.pop();
+            }
+            0x0D => self.popup_send(),
+            0x1B => self.popup_focus(false),
+            _ => {}
+        }
+    }
+
+    pub fn popup_char(&mut self, c: char) {
+        if c == '\u{16}' {
+            // Ctrl+V
+            if let Some(t) = crate::claude_app::clipboard_text() {
+                self.popup.draft.push_str(&t.replace(['\r', '\n'], " "));
+            }
+        } else if !c.is_control() && self.popup.draft.chars().count() < 2000 {
+            self.popup.draft.push(c);
+        }
+    }
+
+    /// Hands the message to the Claude app (pasted in its box, for you to send there).
+    fn popup_send(&mut self) {
+        let text = self.popup.draft.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.popup_focus(false);
+        self.popup.note = Some(match crate::claude_app::paste(&text) {
+            Ok(()) => {
+                self.popup.draft.clear();
+                ("Pasted in the Claude app \u{2014} press Enter there to send".to_owned(), Instant::now(), true)
+            }
+            Err(e) => (e.to_owned(), Instant::now(), false),
+        });
+    }
+
+    pub fn popup_moved(&mut self) {
+        let mut r = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.popup.hwnd, &mut r);
+        }
+        self.popup.pos = (r.left, r.top);
+        self.gfx.move_surface(self.popup.surface, self.popup.pos);
+    }
+
+    /// A glass card for one session: what it is, what it's doing, its task list, and the
+    /// latest exchange.
+    fn draw_popup(&mut self) {
+        self.popup.last = Instant::now();
+        let Some(s) = self.popup.session.as_ref().and_then(|id| self.claude_list.iter().find(|s| &s.id == id)).cloned() else {
+            // Gone from the list (too old): nothing to show.
+            if self.claude_list.iter().all(|x| Some(&x.id) != self.popup.session.as_ref()) && !self.claude_list.is_empty() {
+                self.close_popup();
+            }
+            return;
+        };
+        if self.gfx.begin(self.popup.surface).is_err() {
+            return;
+        }
+        let g = &self.gfx;
+        let t = self.t0.elapsed().as_secs_f32();
+        let pane = Rect::new(1.0, 1.0, PP_W - 2.0, PP_H - 2.0);
+        if self.store.settings.glass {
+            g.glass_rrect(pane, 26.0);
+        } else {
+            g.fill_rrect(pane, 26.0, rgba(8, 8, 12, 0.95));
+            g.stroke_rrect(pane, 26.0, 1.0, white(0.18), false);
+        }
+        // A soft wash of Claude's color from the top-left while it works.
+        if s.state == claude::State::Working {
+            let breath = 0.5 + 0.5 * (t * 1.6).sin();
+            g.radial(40.0, 30.0, 150.0, 90.0, rgba(0xd9, 0x77, 0x57, 0.10 + 0.08 * breath));
+        }
+
+        // Header: the spark, the title, where and how it's doing; the close button.
+        let spin = if s.state == claude::State::Working { t * 90.0 } else { 0.0 };
+        spark(g, 32.0, 30.0, 11.0, CLAUDE, spin);
+        g.text(&s.title, 54.0, 24.0, PP_W - 104.0, 15.0, 700, WHITE, Align::Start);
+        let (label, c) = state_label(s.state);
+        let lw = g.text(label, 54.0, 43.0, 120.0, 10.5, 600, c, Align::Start);
+        let meta = format!("·  {}  ·  {}", s.project, claude::ago(s.age()));
+        g.text(&meta, 54.0 + lw + 6.0, 43.0, PP_W - 120.0 - lw, 10.5, 400, white(0.5), Align::Start);
+        let over = |r: Rect| self.popup.hover.is_some_and(|(x, y)| r.grow(4.0).contains(x, y));
+        let close = popup_close_rect();
+        let lit = over(close);
+        g.fill_circle(close.x + close.w / 2.0, close.y + close.h / 2.0, 11.0, white(if lit { 0.22 } else { 0.1 }));
+        g.icon('\u{E711}', close.x + close.w / 2.0, close.y + close.h / 2.0 + 0.5, 8.5, white(if lit { 1.0 } else { 0.7 }));
+        // The pin: filled in Claude's color while pinned.
+        let pin = popup_pin_rect();
+        let (pcx, pcy) = (pin.x + pin.w / 2.0, pin.y + pin.h / 2.0);
+        if self.popup.pinned {
+            g.fill_circle(pcx, pcy, 11.0, rgba(0xd9, 0x77, 0x57, if over(pin) { 0.45 } else { 0.32 }));
+            g.icon('\u{E842}', pcx, pcy + 0.5, 9.5, CLAUDE);
+        } else {
+            g.fill_circle(pcx, pcy, 11.0, white(if over(pin) { 0.22 } else { 0.1 }));
+            g.icon('\u{E718}', pcx, pcy + 0.5, 9.5, white(if over(pin) { 1.0 } else { 0.7 }));
+        }
+        g.line(18.0, 60.0, PP_W - 18.0, 60.0, 1.0, white(0.1));
+
+        let mut y = 72.0;
+        // What it's doing this moment.
+        if s.state == claude::State::Working {
+            let now = if s.doing.is_empty() { "Thinking\u{2026}".to_owned() } else { s.doing.clone() };
+            g.fill_rrect(Rect::new(18.0, y, PP_W - 36.0, 26.0), 9.0, rgba(0xd9, 0x77, 0x57, 0.14));
+            status_icon(g, claude::State::Working, 32.0, y + 13.0, t);
+            g.text(&now, 46.0, y + 13.0, PP_W - 82.0, 11.5, 500, WHITE, Align::Start);
+            y += 34.0;
+        }
+
+        // Tasks, with a bar for how far along they are.
+        if !s.tasks.is_empty() {
+            let (done, total) = s.tasks_done();
+            g.text("TASKS", 20.0, y + 6.0, 80.0, 9.5, 700, white(0.45), Align::Start);
+            g.text(&format!("{done} of {total}"), PP_W - 120.0, y + 6.0, 100.0, 9.5, 600, white(0.45), Align::End);
+            let bar = Rect::new(66.0, y + 5.0, PP_W - 196.0, 3.0);
+            g.fill_rrect(bar, 1.5, white(0.1));
+            g.fill_rrect(Rect::new(bar.x, bar.y, bar.w * done as f32 / total.max(1) as f32, 3.0), 1.5, GREEN);
+            y += 16.0;
+            let room = if s.state == claude::State::Working { 6 } else { 7 };
+            // Keep the active task in view when the list is long.
+            let active = s.tasks.iter().position(|t| t.1 == claude::Task::Active).unwrap_or(0);
+            let first = active.saturating_sub(room / 2).min(s.tasks.len().saturating_sub(room));
+            for (name, st) in s.tasks.iter().skip(first).take(room) {
+                let cy = y + 9.0;
+                match st {
+                    claude::Task::Done => {
+                        g.fill_circle(28.0, cy, 6.5, rgba(0x2f, 0xd0, 0x6b, 0.9));
+                        g.icon('\u{E73E}', 28.0, cy + 0.5, 7.5, BLACK);
+                    }
+                    claude::Task::Active => {
+                        g.stroke_circle(28.0, cy, 6.0, 1.6, rgba(0xd9, 0x77, 0x57, 0.3));
+                        g.arc(28.0, cy, 6.0, t * 300.0, 110.0, 1.8, CLAUDE);
+                    }
+                    claude::Task::Pending => g.stroke_circle(28.0, cy, 6.0, 1.4, white(0.3)),
+                }
+                let c = match st {
+                    claude::Task::Done => white(0.5),
+                    claude::Task::Active => WHITE,
+                    claude::Task::Pending => white(0.75),
+                };
+                g.text(name, 42.0, cy, PP_W - 62.0, 11.5, if *st == claude::Task::Active { 600 } else { 400 }, c, Align::Start);
+                y += 19.0;
+            }
+            y += 8.0;
+        }
+
+        // The latest exchange: you, then Claude.
+        g.line(18.0, y, PP_W - 18.0, y, 1.0, white(0.08));
+        y += 10.0;
+        let bottom = popup_field_rect().y - 10.0;
+        if !s.prompt.is_empty() && bottom - y > 40.0 {
+            g.text("YOU", 20.0, y + 6.0, 60.0, 9.5, 700, white(0.45), Align::Start);
+            y += 14.0;
+            y += g.paragraph(&s.prompt, 20.0, y, PP_W - 40.0, 11.5, 400, white(0.85), 2) + 10.0;
+        }
+        if !s.reply.is_empty() && bottom - y > 30.0 {
+            spark(g, 24.0, y + 6.0, 4.5, CLAUDE, 0.0);
+            g.text("CLAUDE", 33.0, y + 6.0, 80.0, 9.5, 700, CLAUDE, Align::Start);
+            y += 14.0;
+            let lines = (((bottom - y) / (11.5 * 1.42)) as usize).clamp(1, 6);
+            g.paragraph(&s.reply, 20.0, y, PP_W - 40.0, 11.5, 400, WHITE, lines);
+        }
+
+        // The message box along the bottom, with its send button.
+        let field = popup_field_rect();
+        let typing = self.popup.typing;
+        g.fill_rrect(field, 18.0, white(if typing { 0.14 } else if over(field) { 0.1 } else { 0.07 }));
+        if typing {
+            g.stroke_rrect(field, 18.0, 1.2, rgba(0xd9, 0x77, 0x57, 0.7), false);
+        }
+        let text_x = field.x + 16.0;
+        let text_w = field.w - 56.0;
+        let note = self.popup.note.as_ref().filter(|n| n.1.elapsed() < Duration::from_secs(6));
+        if !self.popup.draft.is_empty() {
+            // The end of the message stays in view as it grows.
+            let d = &self.popup.draft;
+            let dw = g.measure(d, 12.0, 400);
+            let align = if dw > text_w { Align::End } else { Align::Start };
+            let w = g.text(d, text_x, field.y + field.h / 2.0, text_w, 12.0, 400, WHITE, align);
+            if typing && (t * 2.0).fract() < 0.55 && !crate::gfx::is_rtl(d) {
+                let cx = text_x + w.min(text_w) + 1.5;
+                g.fill_rrect(Rect::new(cx, field.y + 10.0, 1.6, field.h - 20.0), 0.8, CLAUDE);
+            }
+        } else if let Some((msg, _, ok)) = note {
+            g.text(msg, text_x, field.y + field.h / 2.0, text_w, 11.5, 500, if *ok { GREEN } else { rgb(0xff, 0x8a, 0x8a) }, Align::Start);
+        } else {
+            g.text("Message Claude\u{2026}", text_x, field.y + field.h / 2.0, text_w, 12.0, 400, white(0.4), Align::Start);
+            if typing && (t * 2.0).fract() < 0.55 {
+                g.fill_rrect(Rect::new(text_x - 2.0, field.y + 10.0, 1.6, field.h - 20.0), 0.8, CLAUDE);
+            }
+        }
+        let send = popup_send_rect();
+        let ready = !self.popup.draft.trim().is_empty();
+        let sc = if ready { if over(send) { rgb(0xe8, 0x88, 0x68) } else { CLAUDE } } else { white(0.12) };
+        g.fill_circle(send.x + send.w / 2.0, send.y + send.h / 2.0, 13.0, sc);
+        g.icon('\u{E74A}', send.x + send.w / 2.0, send.y + send.h / 2.0 + 0.5, 10.0, if ready { WHITE } else { white(0.4) });
+
+        if let Some(dir) = std::env::var_os("HILAL_DUMP") {
+            // One picture as it opens, one with a message being typed.
+            if !self.popup.dumped {
+                self.popup.dumped = true;
+                self.gfx.dump_to = Some(PathBuf::from(dir).join("claude-popup.png"));
+            } else if self.popup.typing && self.popup.draft.len() > 8 && self.gfx.dump_to.is_none() {
+                self.gfx.dump_to = Some(PathBuf::from(dir).join("claude-popup-typing.png"));
+            }
+        }
+        let _ = self.gfx.present();
+    }
+
     // ----- video download ---------------------------------------------------------------
 
     fn download_page(&self) {
@@ -2669,6 +3132,50 @@ enum Ico {
     Plus,
 }
 
+/// Claude's spark: a burst of rounded rays, turned by `deg`.
+fn spark(g: &Gfx, cx: f32, cy: f32, r: f32, c: Color, deg: f32) {
+    for i in 0..8 {
+        let a = (deg + i as f32 * 22.5).to_radians();
+        let len = if i % 2 == 0 { r } else { r * 0.72 };
+        let (s, co) = a.sin_cos();
+        g.line(cx - co * len, cy - s * len, cx + co * len, cy + s * len, (r * 0.2).max(1.4), c);
+    }
+}
+
+/// A session's state as a small icon: a turning arc while it works, a pulsing dot when it
+/// needs you, a check when done, a pause mark when stopped.
+fn status_icon(g: &Gfx, st: claude::State, cx: f32, cy: f32, t: f32) {
+    match st {
+        claude::State::Working => {
+            g.stroke_circle(cx, cy, 5.5, 1.8, rgba(0xd9, 0x77, 0x57, 0.25));
+            g.arc(cx, cy, 5.5, t * 320.0, 120.0, 2.0, CLAUDE);
+        }
+        claude::State::NeedsYou => {
+            let p = 0.5 + 0.5 * (t * 4.0).sin();
+            g.fill_circle(cx, cy, 6.0 + 2.0 * p, rgba(0xff, 0xc4, 0x3d, 0.25 * (1.0 - p)));
+            g.fill_circle(cx, cy, 4.0, AMBER);
+        }
+        claude::State::Done => {
+            g.fill_circle(cx, cy, 6.0, rgba(0x2f, 0xd0, 0x6b, 0.9));
+            g.icon('\u{E73E}', cx, cy + 0.5, 7.0, BLACK);
+        }
+        claude::State::Stopped => {
+            g.stroke_circle(cx, cy, 5.5, 1.4, white(0.4));
+            g.fill_rrect(Rect::new(cx - 2.6, cy - 2.8, 1.8, 5.6), 0.6, white(0.6));
+            g.fill_rrect(Rect::new(cx + 0.8, cy - 2.8, 1.8, 5.6), 0.6, white(0.6));
+        }
+    }
+}
+
+fn state_label(st: claude::State) -> (&'static str, Color) {
+    match st {
+        claude::State::Working => ("Working", CLAUDE),
+        claude::State::NeedsYou => ("Waiting for you", AMBER),
+        claude::State::Done => ("Done", GREEN),
+        claude::State::Stopped => ("Stopped", white(0.6)),
+    }
+}
+
 /// A crescent's outline: the disc of radius `r` at (`cx`, `cy`) less a disc of radius
 /// `cut` shifted by `off` from it.
 fn crescent(cx: f32, cy: f32, r: f32, off: (f32, f32), cut: f32) -> Vec<(f32, f32)> {
@@ -2748,16 +3255,21 @@ fn decode_art(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32, Color)> {
     let rgba = square.thumbnail(160, 160).to_rgba8();
     let (w, h) = rgba.dimensions();
     let mut sum = [0f64; 3];
+    let mut weight = 0f64;
     let mut bgra = Vec::with_capacity((w * h * 4) as usize);
     for p in rgba.pixels() {
         let [r, g, b, a] = p.0;
         let k = a as f32 / 255.0;
         bgra.extend_from_slice(&[(b as f32 * k) as u8, (g as f32 * k) as u8, (r as f32 * k) as u8, a]);
-        sum[0] += r as f64;
-        sum[1] += g as f64;
-        sum[2] += b as f64;
+        // Colorful, not-too-dark pixels count most, so a red cover gives red, not brown.
+        let (mx, mn) = (r.max(g).max(b) as f64, r.min(g).min(b) as f64);
+        let wgt = 0.02 + (mx - mn) / 255.0 * (mx / 255.0);
+        sum[0] += r as f64 * wgt;
+        sum[1] += g as f64 * wgt;
+        sum[2] += b as f64 * wgt;
+        weight += wgt;
     }
-    let n = (w * h).max(1) as f64 * 255.0;
+    let n = weight.max(1e-6) * 255.0;
     let avg = [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32, 1.0];
     Some((bgra, w, h, brighten(avg)))
 }

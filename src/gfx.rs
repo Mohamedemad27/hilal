@@ -1004,6 +1004,23 @@ impl Gfx {
         }
     }
 
+    /// Draws wrapped text from its top-left corner, at most `max_lines` lines (the last
+    /// one ends in "…" if it doesn't all fit). Returns the height used.
+    pub fn paragraph(&self, s: &str, x: f32, y: f32, w: f32, size: f32, weight: u32, c: Color, max_lines: usize) -> f32 {
+        let Some(l) = self.layout(s, size, weight, w, Align::Start, Face::Text) else { return 0.0 };
+        let line = size * 1.42;
+        unsafe {
+            let _ = l.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            let _ = l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            let _ = l.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.78);
+            let _ = l.SetMaxHeight(line * max_lines as f32 + 1.0);
+            self.rt.DrawTextLayout(pt(x, y), &l, self.solid(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            m.height.min(line * max_lines as f32)
+        }
+    }
+
     pub fn measure(&self, s: &str, size: f32, weight: u32) -> f32 {
         self.measure_face(s, size, weight, Face::Text)
     }

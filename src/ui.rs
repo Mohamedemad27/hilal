@@ -44,6 +44,8 @@ const PILL_TEXT: f32 = 11.5;
 const PILL_PAD: f32 = 11.0;
 /// How long a prayer time stays in the notch if nobody dismisses it.
 const PRAYER_SHOWN: Duration = Duration::from_secs(180);
+/// How long the mouse rests on the thin line (over a maximized window) before it opens.
+const HOVER_REST: Duration = Duration::from_millis(250);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
 /// How long a reminder holds the notch open on its own.
 const ALERT_OPEN: Duration = Duration::from_secs(8);
@@ -325,6 +327,13 @@ pub struct App {
     claude_list: Vec<Session>,
     claude_at: Instant,
     claude_scroll: usize,
+    /// The longest each part of a frame took lately (backdrop, notch, popup), for the
+    /// HILAL_FPS log.
+    parts: (Duration, Duration, Duration),
+    /// Where the System page's little GPU fan has turned to (degrees).
+    fan_angle: Cell<f32>,
+    /// When the popup last opened (for test pictures).
+    popup_opened_at: Option<Instant>,
     /// What's playing, as live levels for the closed notch's bars.
     meter: crate::meter::Meter,
     /// The bars as drawn: they leap up with the sound and settle back.
@@ -401,6 +410,11 @@ pub struct App {
     /// aside for a full-screen app.
     top_check: Instant,
     hidden_for_fullscreen: bool,
+    /// A maximized window is in front (on our screen), so the closed notch keeps out of
+    /// its way: a thin line that opens only when the mouse rests on it.
+    over_maximized: bool,
+    /// Since when the mouse has been on the closed notch (for that resting).
+    hover_since: Option<Instant>,
     stats: Stats,
     frame_start: Instant,
     backdrop_retry: Instant,
@@ -455,6 +469,41 @@ struct Popup {
     typing: bool,
     /// What became of the last send (text, when, whether it worked).
     note: Option<(String, Instant, bool)>,
+    /// How far out it is (0 hidden, 1 fully shown) and how fast that's changing: a spring
+    /// toward `showing`, so it eases out of the notch and back into it.
+    shown: f32,
+    speed: f32,
+    showing: bool,
+    /// Frames drawn since `fps_at` (logged once a second with HILAL_FPS set).
+    frames: u32,
+    fps_at: Instant,
+}
+
+impl Popup {
+    /// Steps the open/close spring by `dt` seconds: a lively one opening (a hint of
+    /// overshoot), a quick, calm one closing.
+    fn step(&mut self, dt: f32) {
+        let target = if self.showing { 1.0 } else { 0.0 };
+        let (response, damping) = if self.showing { (0.34, 0.72) } else { (0.22, 1.0) };
+        let stiffness = (std::f32::consts::TAU / response).powi(2);
+        let friction = 4.0 * std::f32::consts::PI * damping / response;
+        let mut left = dt.min(0.1);
+        while left > 0.0 {
+            let h = left.min(1.0 / 480.0);
+            let a = stiffness * (target - self.shown) - friction * self.speed;
+            self.speed += a * h;
+            self.shown += self.speed * h;
+            left -= h;
+        }
+        if (self.shown - target).abs() < 0.002 && self.speed.abs() < 0.01 {
+            self.shown = target;
+            self.speed = 0.0;
+        }
+    }
+
+    fn animating(&self) -> bool {
+        self.session.is_some() && (self.shown != if self.showing { 1.0 } else { 0.0 })
+    }
 }
 
 fn popup_close_rect() -> Rect {
@@ -516,11 +565,14 @@ impl App {
         win::exclude_from_capture(overlay_hwnd, store.settings.glass);
         win::exclude_from_capture(popup_hwnd, store.settings.glass);
         Self {
-            popup: Popup { hwnd: popup_hwnd, surface: popup_surface, pos: popup_pos, session: None, hover: None, last: now, dumped: false, pinned: false, away_at: None, draft: String::new(), typing: false, note: None },
+            popup: Popup { hwnd: popup_hwnd, surface: popup_surface, pos: popup_pos, session: None, hover: None, last: now, dumped: false, pinned: false, away_at: None, draft: String::new(), typing: false, note: None, shown: 0.0, speed: 0.0, showing: false, frames: 0, fps_at: now },
             sessions: claude::Sessions::start(),
             claude_list: Vec::new(),
             claude_at: now,
             claude_scroll: 0,
+            popup_opened_at: None,
+            fan_angle: Cell::new(0.0),
+            parts: Default::default(),
             overlay: Overlay { hwnd: overlay_hwnd, surface, pos: overlay_pos, hover: false, dirty: true, dumps: 0, last: now },
             hwnd,
             gfx,
@@ -580,6 +632,8 @@ impl App {
             capture_until: None,
             replay: None,
             hidden_for_fullscreen: false,
+            over_maximized: false,
+            hover_since: None,
             stats: Stats::new(now),
             frame_start: now,
             backdrop_retry: now - Duration::from_secs(10),
@@ -592,8 +646,35 @@ impl App {
         }
     }
 
+    /// The closed notch is a thin line: always, if chosen, or while a maximized window is
+    /// in front.
     pub fn minimal(&self) -> bool {
+        self.store.settings.minimal || self.over_maximized
+    }
+
+    /// The "Minimal notch" choice itself (for the tray menu).
+    pub fn minimal_setting(&self) -> bool {
         self.store.settings.minimal
+    }
+
+    /// What the notch does while a maximized window is in front: 0 stays as it is,
+    /// 1 shrinks to a thin line, 2 hides.
+    pub fn maximized_mode(&self) -> u8 {
+        let s = &self.store.settings;
+        if s.hide_over_maximized {
+            2
+        } else if s.shrink_over_maximized {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub fn set_maximized_mode(&mut self, mode: u8) {
+        self.store.settings.shrink_over_maximized = mode == 1;
+        self.store.settings.hide_over_maximized = mode == 2;
+        self.store.save();
+        self.keep_on_top();
     }
 
     pub fn set_minimal(&mut self, on: bool) {
@@ -632,8 +713,14 @@ impl App {
     /// a video) is in front. The FPS overlay stays, since that's where it's wanted.
     pub fn keep_on_top(&mut self) {
         self.top_check = Instant::now();
-        let fullscreen = self.store.settings.hide_in_fullscreen && foreground_is_fullscreen(&[self.hwnd, self.overlay.hwnd, self.popup.hwnd]);
+        let ours = [self.hwnd, self.overlay.hwnd, self.popup.hwnd];
+        let maximized = (self.store.settings.shrink_over_maximized || self.store.settings.hide_over_maximized)
+            && foreground_is_maximized(self.hwnd, &ours);
+        // Full screen, or a maximized window when chosen: the notch steps aside entirely.
+        let fullscreen = (self.store.settings.hide_in_fullscreen && foreground_is_fullscreen(&ours))
+            || (maximized && self.store.settings.hide_over_maximized);
         unsafe {
+            self.over_maximized = !fullscreen && maximized && self.store.settings.shrink_over_maximized;
             if fullscreen != self.hidden_for_fullscreen {
                 self.hidden_for_fullscreen = fullscreen;
                 let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
@@ -656,6 +743,12 @@ impl App {
     /// vsync-paced present then sets the rhythm).
     pub fn frame(&mut self) -> u32 {
         let now = Instant::now();
+        // A pass that comes much later than the loop's longest rest means something held
+        // it up: note it.
+        let since = now - self.frame_start;
+        if since > Duration::from_millis(250) {
+            trace(&format!("[stall] {} ms since the last pass (notch open {}, popup {:?})", since.as_millis(), self.open, self.popup.session.is_some()));
+        }
         self.frame_start = now;
         if self.store.water.roll_day() {
             self.store.save();
@@ -726,8 +819,19 @@ impl App {
         let alerting = self.alert_until.is_some_and(|t| now < t);
         // While a water reminder is up, hovering it doesn't open the page (its buttons are
         // right there); an already-open notch stays open.
-        let hover_opens = self.inside && (!self.peeking() || self.open);
+        // Over a maximized window, a pass over the thin line on the way to its tabs doesn't
+        // open it: the mouse has to rest there a moment.
+        if self.inside && !self.open {
+            self.hover_since.get_or_insert(now);
+        } else {
+            self.hover_since = None;
+        }
+        let rested = !self.over_maximized || self.open || self.hover_since.is_some_and(|t| now - t >= HOVER_REST);
+        let hover_opens = self.inside && rested && (!self.peeking() || self.open);
         if hover_opens || self.form.is_some() || alerting {
+            if !self.open {
+                trace(&format!("[open] hover {} rested {:?} over maximized {} form {} alert {}", hover_opens, self.hover_since.map(|t| (now - t).as_millis()), self.over_maximized, self.form.is_some(), alerting));
+            }
             self.open = true;
             self.left_at = None;
         } else if self.open {
@@ -766,7 +870,12 @@ impl App {
                 self.backdrop_retry = now;
                 self.gfx.enable_backdrop();
             }
+            let t_bd = Instant::now();
             let changed = self.gfx.update_backdrop();
+            self.parts.0 = self.parts.0.max(t_bd.elapsed());
+            if t_bd.elapsed() > Duration::from_millis(50) {
+                trace(&format!("[slow] backdrop {} ms", t_bd.elapsed().as_millis()));
+            }
             backdrop_changed = changed & (1 << gfx::MAIN) != 0;
             if changed & (1 << self.overlay.surface) != 0 {
                 self.overlay.dirty = true;
@@ -794,29 +903,62 @@ impl App {
 
         let animating = !self.anim.done();
         let playing = self.track.as_ref().is_some_and(|t| t.playing);
-        let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking();
+        let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking() || self.popup.animating();
         let sig = self.closed_signature();
         if busy || backdrop_changed || sig != self.closed_sig {
             self.closed_sig = sig;
             self.request_dump(animating);
+            let t_n = Instant::now();
             self.draw();
+            self.parts.1 = self.parts.1.max(t_n.elapsed());
+            if t_n.elapsed() > Duration::from_millis(50) {
+                trace(&format!("[slow] notch draw {} ms", t_n.elapsed().as_millis()));
+            }
         }
-        // Claude's sessions: the list refreshes twice a second; the popup redraws at 30 fps
+        // Claude's sessions: the list refreshes twice a second; the popup redraws at 60 fps
         // while open (its spinners turn), noting where the cursor is over it.
         if self.claude_at.elapsed() > Duration::from_millis(500) {
             self.claude_at = now;
-            self.claude_list = self.sessions.list();
+            {
+                let t_x = Instant::now();
+                self.claude_list = self.sessions.list();
+                if t_x.elapsed() > Duration::from_millis(50) {
+                    trace(&format!("[slow] sessions list {} ms", t_x.elapsed().as_millis()));
+                }
+            }
         }
-        if self.popup.session.is_some() && self.popup.last.elapsed() >= Duration::from_millis(33) {
+        // (Every frame while it springs open or shut.)
+        let popup_due = self.popup.animating() || self.popup.last.elapsed() >= Duration::from_millis(15);
+        if self.popup.session.is_some() && popup_due {
             let k = self.gfx.scale;
             self.popup.hover = win::cursor_px()
                 .map(|(x, y)| ((x - self.popup.pos.0) as f32 / k, (y - self.popup.pos.1) as f32 / k))
                 .filter(|&(x, y)| x >= 0.0 && y >= 0.0 && x < PP_W && y < PP_H);
+            let t_p = Instant::now();
             self.draw_popup();
-            // Unpinned and untouched, it follows the notch: once the mouse has left both
-            // for a moment, it closes.
+            self.parts.2 = self.parts.2.max(t_p.elapsed());
+            if t_p.elapsed() > Duration::from_millis(50) {
+                trace(&format!("[slow] popup draw {} ms", t_p.elapsed().as_millis()));
+            }
+            // Unpinned, it follows the notch: once the mouse has left both for a moment, it
+            // closes. Only a message being typed holds it (a draft left behind waits for
+            // next time).
             let p = &self.popup;
-            if p.pinned || p.typing || !p.draft.is_empty() || p.hover.is_some() || self.inside {
+            if !p.showing {
+                // Closing: once it has folded away, hide the window.
+                if p.shown <= 0.0 {
+                    self.popup.session = None;
+                    unsafe {
+                        {
+                            let t_x = Instant::now();
+                            let _ = ShowWindow(self.popup.hwnd, SW_HIDE);
+                            if t_x.elapsed() > Duration::from_millis(50) {
+                                trace(&format!("[slow] hide popup {} ms", t_x.elapsed().as_millis()));
+                            }
+                        }
+                    }
+                }
+            } else if p.pinned || (p.typing && !p.draft.is_empty()) || p.hover.is_some() || self.inside {
                 self.popup.away_at = None;
             } else if self.popup.away_at.get_or_insert(now).elapsed() > Duration::from_millis(450) {
                 self.close_popup();
@@ -826,12 +968,30 @@ impl App {
         if overlay_on && self.overlay.dirty && self.overlay.last.elapsed() >= Duration::from_millis(33) {
             self.draw_overlay();
         }
-        self.update_region();
+        {
+            let t_x = Instant::now();
+            self.update_region();
+            if t_x.elapsed() > Duration::from_millis(50) {
+                trace(&format!("[slow] update region {} ms", t_x.elapsed().as_millis()));
+            }
+        }
         if self.top_check.elapsed() > Duration::from_secs(2) {
+            let t_k = Instant::now();
             self.keep_on_top();
+            if t_k.elapsed() > Duration::from_millis(50) {
+                trace(&format!("[slow] keep on top {} ms", t_k.elapsed().as_millis()));
+            }
         }
         self.log_screen();
-        if busy { 0 } else { 120 }
+        // An open popup keeps a 60 fps pace of its own (its spinners, caret and hover),
+        // even while the notch itself rests.
+        if busy {
+            0
+        } else if self.popup.session.is_some() {
+            16
+        } else {
+            120
+        }
     }
 
     // ----- FPS overlay ------------------------------------------------------------------
@@ -1119,7 +1279,8 @@ impl App {
         if self.welcoming() || self.peeking() {
             return PEEK;
         }
-        if let Some(line) = self.closed_lyric() {
+        // (Over a maximized window, not even the lyric line widens it.)
+        if let Some(line) = self.closed_lyric().filter(|_| !self.over_maximized) {
             let w = (self.gfx.measure(&line, 13.0, 600) + 80.0).clamp(IDLE.w, WIDE.w);
             return Shape { w, ..IDLE };
         }
@@ -1372,6 +1533,7 @@ impl App {
     }
 
     fn perform(&mut self, a: Action, x: f32) {
+        trace(&format!("[action] {a:?}"));
         use Action::*;
         let idx = self.page.index();
         let w = &mut self.store.water;
@@ -1679,7 +1841,14 @@ impl App {
         g.unclip();
         self.last_draw.set(Instant::now());
         let cpu = self.frame_start.elapsed().max(started.elapsed());
+        if started.elapsed() > Duration::from_millis(50) {
+            trace(&format!("[slow] notch building {} ms", started.elapsed().as_millis()));
+        }
+        let t_present = Instant::now();
         let _ = self.gfx.present();
+        if t_present.elapsed() > Duration::from_millis(50) {
+            trace(&format!("[slow] notch present {} ms", t_present.elapsed().as_millis()));
+        }
         self.count_frame(cpu);
     }
 
@@ -2573,6 +2742,15 @@ impl App {
     }
 
     fn open_popup(&mut self, id: String) {
+        trace(&format!("[popup] open {id} (was open {})", self.popup.session.is_some()));
+        if self.popup.session.is_none() {
+            self.popup.shown = 0.0;
+            self.popup.speed = 0.0;
+            self.popup.last = Instant::now();
+        }
+        self.popup.showing = true;
+        self.popup_opened_at = Some(Instant::now());
+        self.popup.away_at = None;
         self.popup.session = Some(id);
         unsafe {
             let _ = ShowWindow(self.popup.hwnd, SW_SHOWNOACTIVATE);
@@ -2583,13 +2761,12 @@ impl App {
         self.draw_popup();
     }
 
+    /// Folds the popup back into the notch (the frame loop hides it once it's gone).
     pub fn close_popup(&mut self) {
+        trace("[popup] close");
         self.popup_focus(false);
         self.popup.away_at = None;
-        self.popup.session = None;
-        unsafe {
-            let _ = ShowWindow(self.popup.hwnd, SW_HIDE);
-        }
+        self.popup.showing = false;
     }
 
     /// Whether a screen point (physical px) on the popup should drag it: its header,
@@ -2601,6 +2778,7 @@ impl App {
     }
 
     pub fn popup_click(&mut self, x: f32, y: f32) {
+        trace(&format!("[popup] click at {x:.0},{y:.0}"));
         if popup_close_rect().grow(4.0).contains(x, y) {
             self.close_popup();
         } else if popup_pin_rect().grow(4.0).contains(x, y) {
@@ -2686,7 +2864,29 @@ impl App {
     /// A glass card for one session: what it is, what it's doing, its task list, and the
     /// latest exchange.
     fn draw_popup(&mut self) {
+        let dt = self.popup.last.elapsed().as_secs_f32();
         self.popup.last = Instant::now();
+        self.popup.step(dt);
+        self.popup.frames += 1;
+        if self.popup.fps_at.elapsed() >= Duration::from_secs(1) {
+            if let Some(path) = std::env::var_os("HILAL_FPS") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+                    let _ = writeln!(
+                        f,
+                        "  [popup] {} fps   longest: backdrop {:.1} ms, notch {:.1} ms, popup {:.1} ms",
+                        self.popup.frames,
+                        ms(self.parts.0),
+                        ms(self.parts.1),
+                        ms(self.parts.2)
+                    );
+                    self.parts = Default::default();
+                }
+            }
+            self.popup.frames = 0;
+            self.popup.fps_at = Instant::now();
+        }
         let Some(s) = self.popup.session.as_ref().and_then(|id| self.claude_list.iter().find(|s| &s.id == id)).cloned() else {
             // Gone from the list (too old): nothing to show.
             if self.claude_list.iter().all(|x| Some(&x.id) != self.popup.session.as_ref()) && !self.claude_list.is_empty() {
@@ -2699,6 +2899,10 @@ impl App {
         }
         let g = &self.gfx;
         let t = self.t0.elapsed().as_secs_f32();
+        // It grows out of the notch above it: from a little smaller, a little higher, and
+        // transparent; closing runs the same way back.
+        let v = self.popup.shown;
+        g.push_layer(v.clamp(0.0, 1.0).powf(0.8), 0.9 + 0.1 * v, PP_W / 2.0, 0.0, -18.0 * (1.0 - v));
         let pane = Rect::new(1.0, 1.0, PP_W - 2.0, PP_H - 2.0);
         if self.store.settings.glass {
             g.glass_rrect(pane, 26.0);
@@ -2835,9 +3039,19 @@ impl App {
         g.fill_circle(send.x + send.w / 2.0, send.y + send.h / 2.0, 13.0, sc);
         g.icon('\u{E74A}', send.x + send.w / 2.0, send.y + send.h / 2.0 + 0.5, 10.0, if ready { WHITE } else { white(0.4) });
 
+        g.pop_layer();
+
         if let Some(dir) = std::env::var_os("HILAL_DUMP") {
-            // One picture as it opens, one with a message being typed.
-            if !self.popup.dumped {
+            // One picture as it opens, one with a message being typed, and one halfway
+            // through opening and closing.
+            let v = self.popup.shown;
+            let mid = if self.popup.showing { "claude-popup-opening.png" } else { "claude-popup-closing.png" };
+            let mid = PathBuf::from(&dir).join(mid);
+            if self.popup.animating() && (0.35..0.65).contains(&v) && !mid.exists() && self.gfx.dump_to.is_none() {
+                self.gfx.dump_to = Some(mid);
+            } else if let Some(n) = [1u64, 4].into_iter().find(|&n| !PathBuf::from(&dir).join(format!("claude-popup-{n}s.png")).exists() && self.popup_opened_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(n))) {
+                self.gfx.dump_to = Some(PathBuf::from(&dir).join(format!("claude-popup-{n}s.png")));
+            } else if !self.popup.dumped && !self.popup.animating() {
                 self.popup.dumped = true;
                 self.gfx.dump_to = Some(PathBuf::from(dir).join("claude-popup.png"));
             } else if self.popup.typing && self.popup.draft.len() > 8 && self.gfx.dump_to.is_none() {
@@ -3046,6 +3260,27 @@ impl App {
             g.text(label, cx - 30.0, 99.0, 60.0, 10.5, 600, white(0.85), Align::Center);
             g.text(&sub, cx - 30.0, 112.0, 60.0, 9.0, 400, white(0.5), Align::Center);
         }
+        // The GPU's fan under its gauge: a little fan turning with it, and its speed.
+        let fan = match (s.gpu_fan_rpm, s.gpu_fan_pct) {
+            (Some(0), _) | (None, Some(0)) => Some(("fan off".to_owned(), 0.0)),
+            (Some(rpm), _) => Some((format!("{rpm} rpm"), rpm as f32)),
+            (None, Some(p)) => Some((format!("fan {p}%"), p as f32 * 30.0)),
+            _ => None,
+        };
+        if let Some((label, rpm)) = fan {
+            // One turn a second per 1000 RPM: the real speed would only strobe.
+            let angle = self.fan_angle.get() + dt * rpm / 1000.0 * 360.0;
+            self.fan_angle.set(angle % 360.0);
+            let tw = g.measure(&label, 8.5, 500);
+            let (fx, fy) = (134.0 - (tw + 11.0) / 2.0 + 4.0, 123.5);
+            let c = if rpm > 0.0 { VIOLET } else { white(0.35) };
+            for k in 0..3 {
+                let a = (angle + k as f32 * 120.0).to_radians();
+                g.line(fx, fy, fx + 3.6 * a.cos(), fy + 3.6 * a.sin(), 1.6, c);
+            }
+            g.fill_circle(fx, fy, 1.1, c);
+            g.text(&label, fx + 7.0, fy, tw + 4.0, 8.5, 500, if rpm > 0.0 { white(0.6) } else { white(0.35) }, Align::Start);
+        }
         g.line(232.0, 34.0, 232.0, 120.0, 1.0, white(0.12));
 
         // What the screen is actually showing per second, against the display's limit.
@@ -3130,6 +3365,16 @@ enum Ico {
     Play,
     Pause,
     Plus,
+}
+
+/// With HILAL_FPS=<file> set, notes an event in that file (time-stamped).
+pub fn trace(msg: &str) {
+    let Some(path) = std::env::var_os("HILAL_FPS") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let t = win::seconds_of_day();
+        let _ = writeln!(f, "  {:02}:{:02}:{:02} {msg}", t / 3600, t / 60 % 60, t % 60);
+    }
 }
 
 /// Claude's spark: a burst of rounded rays, turned by `deg`.
@@ -3381,6 +3626,25 @@ fn foreground_is_fullscreen(ours: &[HWND]) -> bool {
         }
         let m = info.rcMonitor;
         r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+
+/// Whether the window in front is maximized on the notch's screen (not one of ours, the
+/// desktop or the taskbar).
+fn foreground_is_maximized(notch: HWND, ours: &[HWND]) -> bool {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || ours.contains(&fg) || !IsZoomed(fg).as_bool() {
+            return false;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(fg, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+        MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == MonitorFromWindow(notch, MONITOR_DEFAULTTONEAREST)
     }
 }
 

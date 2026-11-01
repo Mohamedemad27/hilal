@@ -271,11 +271,16 @@ pub struct Settings {
     pub overlay_pos: Option<(i32, i32)>,
     /// Step the notch aside while a full-screen app is in front.
     pub hide_in_fullscreen: bool,
+    /// Shrink the closed notch to a thin line while a maximized window (a browser full
+    /// of tabs, say) is in front, so it doesn't cover what's at the top of it.
+    pub shrink_over_maximized: bool,
+    /// Or hide it altogether there (as in full screen).
+    pub hide_over_maximized: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true }
+        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true, shrink_over_maximized: true, hide_over_maximized: false }
     }
 }
 

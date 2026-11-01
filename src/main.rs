@@ -44,6 +44,9 @@ const MENU_OVERLAY: usize = 5;
 const MENU_FULLSCREEN: usize = 6;
 const MENU_ADHAN: usize = 7;
 const MENU_BELLS: usize = 8;
+const MENU_MAX_SHRINK: usize = 9;
+const MENU_MAX_KEEP: usize = 10;
+const MENU_MAX_HIDE: usize = 11;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Bottom edge of the area (physical px) where cursor moves should wake the loop.
@@ -226,12 +229,20 @@ fn main() -> Result<()> {
                     break 'run;
                 }
                 let _ = TranslateMessage(&msg);
+                let t = std::time::Instant::now();
                 DispatchMessageW(&msg);
+                if t.elapsed() > std::time::Duration::from_millis(100) {
+                    ui::trace(&format!("[slow message] 0x{:04x} took {} ms", msg.message, t.elapsed().as_millis()));
+                }
             }
             WAKE_PENDING.store(false, Ordering::Release);
             // When still, the mouse hook wakes us instantly when needed; otherwise we
             // check the clock, reminders and the glass backdrop a few times a second.
+            let t = std::time::Instant::now();
             let wait = with_app(|a| a.frame()).unwrap_or(120);
+            if t.elapsed() > std::time::Duration::from_millis(100) {
+                ui::trace(&format!("[slow frame] {} ms", t.elapsed().as_millis()));
+            }
             if wait > 0 {
                 MsgWaitForMultipleObjects(None, false, wait, QS_ALLINPUT);
             }
@@ -305,7 +316,8 @@ fn add_tray(hwnd: HWND) {
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn tray_menu(hwnd: HWND) {
-    let minimal = with_app(|a| a.minimal()).unwrap_or(false);
+    let minimal = with_app(|a| a.minimal_setting()).unwrap_or(false);
+    let max_mode = with_app(|a| a.maximized_mode()).unwrap_or(1);
     let glass = with_app(|a| a.glass()).unwrap_or(false);
     let overlay = with_app(|a| a.overlay_shown()).unwrap_or(false);
     let fullscreen = with_app(|a| a.hide_in_fullscreen()).unwrap_or(true);
@@ -317,6 +329,13 @@ fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(glass), MENU_GLASS, w!("Liquid Glass"));
         let _ = AppendMenuW(menu, check(minimal), MENU_MINIMAL, w!("Minimal notch"));
         let _ = AppendMenuW(menu, check(overlay), MENU_OVERLAY, w!("FPS overlay"));
+        // Over maximized windows: one of three.
+        if let Ok(sub) = CreatePopupMenu() {
+            let _ = AppendMenuW(sub, check(max_mode == 0), MENU_MAX_KEEP, w!("Stay as it is"));
+            let _ = AppendMenuW(sub, check(max_mode == 1), MENU_MAX_SHRINK, w!("Shrink to a thin line"));
+            let _ = AppendMenuW(sub, check(max_mode == 2), MENU_MAX_HIDE, w!("Hide"));
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Over maximized windows"));
+        }
         let _ = AppendMenuW(menu, check(fullscreen), MENU_FULLSCREEN, w!("Hide in full screen"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let adhan = sound::adhan().is_some();
@@ -341,6 +360,15 @@ fn tray_menu(hwnd: HWND) {
             }
             MENU_OVERLAY => {
                 with_app(|a| a.set_overlay(!overlay));
+            }
+            MENU_MAX_KEEP => {
+                with_app(|a| a.set_maximized_mode(0));
+            }
+            MENU_MAX_SHRINK => {
+                with_app(|a| a.set_maximized_mode(1));
+            }
+            MENU_MAX_HIDE => {
+                with_app(|a| a.set_maximized_mode(2));
             }
             MENU_FULLSCREEN => {
                 with_app(|a| a.set_hide_in_fullscreen(!fullscreen));

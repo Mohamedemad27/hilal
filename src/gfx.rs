@@ -130,6 +130,10 @@ pub struct Gfx {
     /// When every backdrop was last copied whole (a periodic refresh, so a still area of
     /// the screen can never leave the glass stuck on an old or blank image).
     last_full: std::time::Instant,
+    /// The whole desktop as last captured. Windows only hands over a new image when the
+    /// screen changes, so a backdrop that needs filling (new, moved, refreshed) takes it
+    /// from here instead of waiting for the screen to change.
+    desk: Option<ID3D11Texture2D>,
     pub screen_dirty: Option<(i32, i32, i32, i32)>,
     pub presents: u64,
     font: String,
@@ -189,6 +193,7 @@ impl Gfx {
                 dump_to: None,
                 screen_frames: 0,
                 last_full: std::time::Instant::now(),
+                desk: None,
                 screen_dirty: None,
                 presents: 0,
                 font: font.into(),
@@ -282,6 +287,32 @@ impl Gfx {
         }
     }
 
+    /// Draws what follows (until `pop_layer`) as one piece: faded to `opacity`, scaled by
+    /// `k` around (`cx`, `cy`) and moved down by `dy`. For a whole window coming and going.
+    pub fn push_layer(&self, opacity: f32, k: f32, cx: f32, cy: f32, dy: f32) {
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: cx - k * cx, M32: cy - k * cy + dy };
+        unsafe {
+            self.rt.SetTransform(&m);
+            let params = D2D1_LAYER_PARAMETERS1 {
+                contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
+                geometricMask: std::mem::ManuallyDrop::new(None),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 },
+                opacity: opacity.clamp(0.0, 1.0),
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+            };
+            self.rt.PushLayer(&params, None);
+        }
+    }
+
+    pub fn pop_layer(&self) {
+        unsafe {
+            self.rt.PopLayer();
+            self.rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+        }
+    }
+
     pub fn begin(&mut self, id: usize) -> Result<()> {
         self.current = id;
         unsafe {
@@ -358,6 +389,7 @@ impl Gfx {
 
     pub fn disable_backdrop(&mut self) {
         self.dup = None;
+        self.desk = None;
         for s in &mut self.surfaces {
             s.behind = None;
         }
@@ -431,35 +463,71 @@ impl Gfx {
     /// Pulls the newest desktop image if the screen changed. Returns a bit per surface
     /// (1 << id) whose backdrop changed.
     pub fn update_backdrop(&mut self) -> u32 {
-        let Some((dup, _)) = &self.dup else { return 0 };
+        let changed = self.pull_frame();
+        changed | self.fill_fresh()
+    }
+
+    /// Backdrops that need a whole new image take it from the last desktop capture; every
+    /// two seconds all of them do, so none can stay stuck on an old or blank image.
+    fn fill_fresh(&mut self) -> u32 {
+        if self.last_full.elapsed() > std::time::Duration::from_secs(2) {
+            self.last_full = std::time::Instant::now();
+            for s in &mut self.surfaces {
+                s.fresh = true;
+            }
+        }
+        let Some(desk) = &self.desk else { return 0 };
+        let mut changed = 0u32;
+        for (id, s) in self.surfaces.iter_mut().enumerate() {
+            if let (true, Some((tex, _, b))) = (s.fresh, &s.behind) {
+                unsafe { self.ctx.CopySubresourceRegion(tex, 0, 0, 0, 0, desk, 0, Some(b)) };
+                s.fresh = false;
+                changed |= 1 << id;
+            }
+        }
+        changed
+    }
+
+    /// Takes the newest desktop image if the screen changed: keeps the whole of it, and
+    /// updates the backdrops where it changed behind them.
+    fn pull_frame(&mut self) -> u32 {
+        let Some((dup, _)) = self.dup.clone() else { return 0 };
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res = None;
             match dup.AcquireNextFrame(0, &mut info, &mut res) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return 0,
-                Err(_) => {
+                Err(e) => {
                     // Access lost (mode change, secure desktop): drop it; the owner retries.
+                    if let Some(path) = std::env::var_os("HILAL_FPS") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(f, "  [glass] capture lost: {e}");
+                        }
+                    }
                     self.disable_backdrop();
                     return 0;
                 }
             }
             let mut changed = 0u32;
-            if self.last_full.elapsed() > std::time::Duration::from_secs(2) {
-                self.last_full = std::time::Instant::now();
-                for s in &mut self.surfaces {
-                    s.fresh = true;
-                }
-            }
-            // A new or moved backdrop takes the whole image behind it from this frame.
+            // Keep the whole new image.
             if info.LastPresentTime != 0 {
                 if let Some(frame) = res.as_ref().and_then(|r| r.cast::<ID3D11Texture2D>().ok()) {
-                    for (id, s) in self.surfaces.iter_mut().enumerate() {
-                        if let (true, Some((tex, _, b))) = (s.fresh, &s.behind) {
-                            self.ctx.CopySubresourceRegion(tex, 0, 0, 0, 0, &frame, 0, Some(b));
-                            s.fresh = false;
-                            changed |= 1 << id;
+                    if self.desk.is_none() {
+                        let mut d = D3D11_TEXTURE2D_DESC::default();
+                        frame.GetDesc(&mut d);
+                        d.Usage = D3D11_USAGE_DEFAULT;
+                        d.BindFlags = 0;
+                        d.CPUAccessFlags = 0;
+                        d.MiscFlags = 0;
+                        let mut t = None;
+                        if self.d3d.CreateTexture2D(&d, None, Some(&mut t)).is_ok() {
+                            self.desk = t;
                         }
+                    }
+                    if let Some(desk) = &self.desk {
+                        self.ctx.CopyResource(desk, &frame);
                     }
                 }
             }

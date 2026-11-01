@@ -7,9 +7,9 @@ use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HGLOBAL, HWND, LPARA
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU, VK_V};
+use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CONTROL, VK_V};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
     ShowWindow, SW_RESTORE,
 };
 
@@ -101,6 +101,33 @@ pub fn find_window() -> Option<HWND> {
     best.map(|(h, _)| h)
 }
 
+/// Focuses the Claude app's message box (its accessibility name is "Prompt"), found
+/// through UI Automation like a screen reader would. Does nothing if it can't be found.
+fn focus_prompt(hwnd: HWND) {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let found = (|| -> windows::core::Result<()> {
+            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = uia.ElementFromHandle(hwnd)?;
+            // Only the text boxes (asking for everything walks the whole app and is slow).
+            let is_edit = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &windows::core::VARIANT::from(UIA_EditControlTypeId.0))?;
+            let edits = root.FindAll(TreeScope_Descendants, &is_edit)?;
+            for i in 0..edits.Length()? {
+                let e = edits.GetElement(i)?;
+                if e.CurrentName()? == "Prompt" {
+                    return e.SetFocus();
+                }
+            }
+            Ok(())
+        })();
+        let _ = found;
+    }
+}
+
 /// Puts `text` in the Claude app's message box. Fails if the app isn't open.
 pub fn paste(text: &str) -> Result<(), &'static str> {
     let hwnd = find_window().ok_or("The Claude app isn't open")?;
@@ -111,22 +138,38 @@ pub fn paste(text: &str) -> Result<(), &'static str> {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        // A tap of Alt lets a background program hand over the foreground.
-        keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        // The popup was just clicked and typed in, so Windows lets us pass the foreground
+        // on. (No Alt-tap trick: a lone Alt moves the app's focus to its menu.)
         let _ = SetForegroundWindow(hwnd);
     }
-    // Give the app a moment to come forward and focus its box, then paste.
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        unsafe {
-            keybd_event(VK_CONTROL.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-            keybd_event(VK_V.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-            keybd_event(VK_V.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    // Paste only once the app really is in front, so Ctrl+V can't land anywhere else; if
+    // it doesn't come forward, the text just waits on the clipboard.
+    let target = hwnd.0 as isize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let front = (0..30).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            unsafe { GetForegroundWindow() }.0 as isize == target
+        });
+        if front {
+            // Put the focus in the message box itself (wherever it was in the app), then a
+            // beat for it to take it.
+            focus_prompt(HWND(target as _));
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            unsafe {
+                keybd_event(VK_CONTROL.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                keybd_event(VK_V.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                keybd_event(VK_V.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+                keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            }
         }
+        let _ = tx.send(front);
     });
-    Ok(())
+    // Up to ~1.3 s, so the popup can say which way it went.
+    match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+        Ok(true) => Ok(()),
+        _ => Err("Copied \u{2014} the Claude app didn't come forward; paste it there with Ctrl+V"),
+    }
 }
 
 #[cfg(test)]

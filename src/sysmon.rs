@@ -27,6 +27,10 @@ pub struct Snapshot {
     /// 0..1, None without a supported GPU.
     pub gpu: Option<f32>,
     pub gpu_temp: Option<u32>,
+    /// The GPU fan: its speed in RPM where the driver tells it, else as a percentage of
+    /// its top speed. (Many cards stop their fans entirely when cool.)
+    pub gpu_fan_rpm: Option<u32>,
+    pub gpu_fan_pct: Option<u32>,
     pub gpu_name: String,
     pub vram: Option<(u64, u64)>,
     /// Bytes per second.
@@ -182,6 +186,18 @@ struct Nvml {
     util: unsafe extern "C" fn(Dev, *mut NvUtil) -> i32,
     temp: unsafe extern "C" fn(Dev, u32, *mut u32) -> i32,
     mem: unsafe extern "C" fn(Dev, *mut NvMem) -> i32,
+    /// Not in every driver, so optional.
+    fan_pct: Option<unsafe extern "C" fn(Dev, *mut u32) -> i32>,
+    fan_rpm: Option<unsafe extern "C" fn(Dev, *mut NvFanRpm) -> i32>,
+}
+
+/// nvmlFanSpeedInfo_v1_t: a struct version, which fan, and its speed in RPM.
+#[repr(C)]
+#[derive(Default)]
+struct NvFanRpm {
+    version: u32,
+    fan: u32,
+    speed: u32,
 }
 
 // The handle is only used from the sampler thread that created it.
@@ -199,6 +215,8 @@ impl Nvml {
                 let util = std::mem::transmute(get(s!("nvmlDeviceGetUtilizationRates"))?);
                 let temp = std::mem::transmute(get(s!("nvmlDeviceGetTemperature"))?);
                 let mem = std::mem::transmute(get(s!("nvmlDeviceGetMemoryInfo"))?);
+                let fan_pct = get(s!("nvmlDeviceGetFanSpeed")).map(|f| std::mem::transmute(f));
+                let fan_rpm = get(s!("nvmlDeviceGetFanSpeedRPM")).map(|f| std::mem::transmute(f));
                 if init() != 0 {
                     return None;
                 }
@@ -213,7 +231,7 @@ impl Nvml {
                 } else {
                     String::new()
                 };
-                Some(Nvml { _lib: lib, dev, name, util, temp, mem })
+                Some(Nvml { _lib: lib, dev, name, util, temp, mem, fan_pct, fan_rpm })
             })();
             if loaded.is_none() {
                 let _ = FreeLibrary(lib);
@@ -236,7 +254,32 @@ impl Nvml {
             if (self.mem)(self.dev, &mut m) == 0 {
                 s.vram = Some((m.used, m.total));
             }
+            if let Some(f) = self.fan_pct {
+                let mut p = 0u32;
+                s.gpu_fan_pct = (f(self.dev, &mut p) == 0).then_some(p);
+            }
+            if let Some(f) = self.fan_rpm {
+                let mut r = NvFanRpm { version: std::mem::size_of::<NvFanRpm>() as u32 | (1 << 24), ..Default::default() };
+                s.gpu_fan_rpm = (f(self.dev, &mut r) == 0).then_some(r.speed);
+            }
         }
         s.gpu_name = self.name.clone();
+    }
+}
+
+#[cfg(test)]
+mod gpu_live {
+    /// Prints what the NVIDIA driver says about the GPU and its fan (run with --ignored
+    /// --nocapture).
+    #[test]
+    #[ignore]
+    fn prints_gpu_fan() {
+        let Some(n) = super::Nvml::load() else {
+            println!("no NVML");
+            return;
+        };
+        let mut s = super::Snapshot::default();
+        n.sample(&mut s);
+        println!("{} temp {:?} fan rpm {:?} fan % {:?}", s.gpu_name, s.gpu_temp, s.gpu_fan_rpm, s.gpu_fan_pct);
     }
 }

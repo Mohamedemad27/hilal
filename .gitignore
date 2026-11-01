@@ -8,3 +8,13 @@
 /research/*.png
 /research/*.csv
 /research/fps.txt
+/research/dl-*
+/research/hilal-*/
+/research/nusa-*/
+/research/*.wav
+/research/adhan/
+/research/chime2/
+/research/download/
+/research/pages/
+/research/prayer-alert/
+/research/press/

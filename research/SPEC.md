@@ -67,3 +67,30 @@ and the preview CSS on the official site (site/site.css). Sizes are in dp (1 dp 
 - HUDs: volume, brightness, Caps Lock, keyboard language.
 - Mascot: when idle, clock fades and a pair of glowing eyes appears; they doze, wave when you return.
 - Tray menu: Start with Windows, Mascot, Minimal notch, About, Exit. Hides for full-screen apps.
+
+## Water reminder: observed behavior (Nusa 1.0.0, tested 2026-11-01)
+
+Data (%APPDATA%\Nusa\water.txt): bottle, goal (ml), start/end (minutes after midnight),
+day, taken (ml today), inb (ml left in the bottle), fired, hours (24 per-hour ml), on.
+
+- **Schedule:** one reminder per 15 minutes inside the hours window, at the middle of each
+  slot (window 16:30-17:30 -> 16:37:30, 16:52:30, 17:07:30, 17:22:30). Slots already past
+  when the window is set are skipped. Reminders stop once the goal is reached, or when off.
+- **Amounts:** reminders = window minutes / 15; each reminder = goal / reminders
+  (shown as "750 ml each"). Refills = goal / bottle - 1.
+- **Settings:** bottle 250+ ml in 50 ml steps; goal chips 1.5/2.0/2.5/3.0 L; hours move in
+  30-minute steps, the window is at least 1 h, and moving the start moves the end with it.
+  Summary card: "<n> reminders", "<n> refills"; Reset.
+- **The reminder is a peek in the notch** (about 310x60), not a Windows toast. It stays
+  until answered (still up after 3 minutes; hovering only lights the icon ring).
+  - Bottle empty (inb < one reminder): bottle icon, "Time to Refill", "Your bottle is
+    probably empty", buttons **Snooze** (gray) and **Refilled** (blue).
+  - Refilled -> inb = bottle, and the peek turns straight into "Time to Drink": drop icon,
+    "Stay hydrated! · <amount>", buttons **Snooze** and **Drank**.
+  - Drank -> taken += one reminder's amount (inb drained), the peek closes.
+  - Snooze -> asks again 10 minutes later ("Next" shows the snoozed time).
+- **Page:** "0.8 / 3.0 L", "Today · 25% · Next 17:20" (or "Reminders off" / "Goal reached");
+  Drink adds one reminder's amount and doesn't move the next reminder; the percentage can
+  pass 100%. Bell switch off: switch and gauge turn gray (Drink still works in 1.0.0).
+- **Chart:** bars only for the window's hours, the current hour highlighted with a bubble
+  showing its ml; axis 0 / goal / 2x goal.

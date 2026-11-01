@@ -117,6 +117,8 @@ pub struct Gfx {
     pub generation: u64,
     /// Multiplies every color's alpha; used to fade page content in and out.
     pub fade: Cell<f32>,
+    /// The (shift, scale, origin x) last set with `transform`, which `scale_at` builds on.
+    base: Cell<(f32, f32, f32)>,
     /// When set, the next presented frame is also saved to this PNG.
     pub dump_to: Option<std::path::PathBuf>,
     /// Desktop frames whose captured content changed (the on-screen FPS counts these),
@@ -126,7 +128,14 @@ pub struct Gfx {
     pub presents: u64,
     font: String,
     icon_font: String,
-    formats: RefCell<HashMap<(u32, u32, bool), IDWriteTextFormat>>,
+    /// Inter, loaded from memory: (family name, its collection).
+    display: Option<(String, IDWriteFontCollection1)>,
+    /// The in-memory loader Inter was registered with; unregistered on drop, before the
+    /// fonts that use it are gone (leaving it registered crashes DirectWrite at exit).
+    font_loader: Option<IDWriteInMemoryFontFileLoader>,
+    /// Typography with tabular figures, for the display face.
+    tabular: Option<IDWriteTypography>,
+    formats: RefCell<HashMap<(u32, u32, u8), IDWriteTextFormat>>,
 }
 
 impl Gfx {
@@ -146,6 +155,14 @@ impl Gfx {
             let icon_font = if fonts.join("SegoeIcons.ttf").exists() { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
             let brush = rt.CreateSolidColorBrush(&color(WHITE), None)?;
             let ctx = d3d.GetImmediateContext()?;
+            let (display, font_loader) = match try_load_inter(&dwrite) {
+                Ok((name, coll, loader)) => (Some((name, coll)), Some(loader)),
+                Err(_) => (None, None),
+            };
+            let tabular = dwrite.CreateTypography().ok().filter(|t| {
+                let tnum = DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 };
+                t.AddFontFeature(tnum).is_ok()
+            });
 
             let mut g = Self {
                 factory,
@@ -162,12 +179,16 @@ impl Gfx {
                 scale,
                 generation: 0,
                 fade: Cell::new(1.0),
+                base: Cell::new((0.0, 1.0, 0.0)),
                 dump_to: None,
                 screen_frames: 0,
                 screen_dirty: None,
                 presents: 0,
                 font: font.into(),
                 icon_font: icon_font.into(),
+                display,
+                font_loader,
+                tabular,
                 formats: RefCell::new(HashMap::new()),
             };
             g.add_surface(hwnd, width_dp, height_dp, pos, true)?;
@@ -274,6 +295,28 @@ impl Gfx {
         self.transform(dx, 1.0, 0.0);
     }
 
+    /// Rotates everything drawn after this call by `deg` (clockwise) around (`cx`, `cy`),
+    /// then shifts it right by `dx`.
+    pub fn rotate(&self, dx: f32, cx: f32, cy: f32, deg: f32) {
+        let (s, c) = deg.to_radians().sin_cos();
+        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - c * cx + s * cy + dx, M32: cy - s * cx - c * cy };
+        unsafe { self.rt.SetTransform(&m) };
+    }
+
+    /// Scales what's drawn next by `k` around (`cx`, `cy`), on top of the current
+    /// `transform`. Undo with `unscale`.
+    pub fn scale_at(&self, cx: f32, cy: f32, k: f32) {
+        let (dx, bk, ox) = self.base.get();
+        let m = Matrix3x2 { M11: k * bk, M12: 0.0, M21: 0.0, M22: k * bk, M31: bk * (cx - k * cx + dx - ox) + ox, M32: bk * (cy - k * cy) };
+        unsafe { self.rt.SetTransform(&m) };
+    }
+
+    /// Back to the current `transform` after `scale_at`.
+    pub fn unscale(&self) {
+        let (dx, k, ox) = self.base.get();
+        self.transform(dx, k, ox);
+    }
+
     /// Shifts everything drawn after this call by (`dx`, `dy`) dp. (Used by the installer.)
     #[allow(dead_code)]
     pub fn translate(&self, dx: f32, dy: f32) {
@@ -284,6 +327,7 @@ impl Gfx {
     /// Shifts by `dx`, then scales by `k` around (`origin_x`, 0): content grows out of the
     /// top edge together with the notch.
     pub fn transform(&self, dx: f32, k: f32, origin_x: f32) {
+        self.base.set((dx, k, origin_x));
         let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: k * (dx - origin_x) + origin_x, M32: 0.0 };
         unsafe { self.rt.SetTransform(&m) };
     }
@@ -424,6 +468,11 @@ impl Gfx {
             let _ = dup.ReleaseFrame();
             changed
         }
+    }
+
+    /// The display face's family, when Inter loaded (else text falls back to Segoe UI).
+    pub fn display_family(&self) -> Option<&str> {
+        self.display.as_ref().map(|(name, _)| name.as_str())
     }
 
     pub fn has_backdrop(&self) -> bool {
@@ -841,18 +890,22 @@ impl Gfx {
 
     // ----- text ---------------------------------------------------------------------
 
-    fn format(&self, size: f32, weight: u32, icon: bool) -> Option<IDWriteTextFormat> {
-        let key = ((size * 10.0) as u32, weight, icon);
+    fn format(&self, size: f32, weight: u32, face: Face) -> Option<IDWriteTextFormat> {
+        let key = ((size * 10.0) as u32, weight, face as u8);
         if let Some(f) = self.formats.borrow().get(&key) {
             return Some(f.clone());
         }
-        let family = if icon { &self.icon_font } else { &self.font };
+        let (family, collection): (&str, Option<IDWriteFontCollection>) = match (face, &self.display) {
+            (Face::Icon, _) => (&self.icon_font, None),
+            (Face::Display, Some((name, coll))) => (name, coll.cast().ok()),
+            _ => (&self.font, None),
+        };
         let f = unsafe {
             let f = self
                 .dwrite
                 .CreateTextFormat(
-                    &HSTRING::from(family.as_str()),
-                    None,
+                    &HSTRING::from(family),
+                    collection.as_ref(),
                     DWRITE_FONT_WEIGHT(weight as i32),
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
@@ -872,11 +925,17 @@ impl Gfx {
         Some(f)
     }
 
-    fn layout(&self, s: &str, size: f32, weight: u32, max_w: f32, align: Align, icon: bool) -> Option<IDWriteTextLayout> {
-        let f = self.format(size, weight, icon)?;
+    fn layout(&self, s: &str, size: f32, weight: u32, max_w: f32, align: Align, face: Face) -> Option<IDWriteTextLayout> {
+        let f = self.format(size, weight, face)?;
         let wide: Vec<u16> = s.encode_utf16().collect();
         unsafe {
             let l = self.dwrite.CreateTextLayout(&wide, &f, max_w.max(1.0), size * 1.6).ok()?;
+            if face == Face::Display {
+                // Same-width digits, so a ticking clock doesn't shuffle sideways.
+                if let Some(t) = &self.tabular {
+                    let _ = l.SetTypography(t, DWRITE_TEXT_RANGE { startPosition: 0, length: wide.len() as u32 });
+                }
+            }
             let rtl = is_rtl(s);
             if rtl {
                 let _ = l.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
@@ -895,16 +954,22 @@ impl Gfx {
 
     /// Draws one line of text vertically centered on `cy`, inside [x, x+w]. Returns the inked width.
     pub fn text(&self, s: &str, x: f32, cy: f32, w: f32, size: f32, weight: u32, c: Color, align: Align) -> f32 {
-        self.draw_layout(s, x, cy, w, size, weight, c, align, false)
+        self.draw_layout(s, x, cy, w, size, weight, c, align, Face::Text)
+    }
+
+    /// Like `text`, in the display face (Inter, with tabular figures): for the clock and
+    /// big numbers.
+    pub fn display(&self, s: &str, x: f32, cy: f32, w: f32, size: f32, weight: u32, c: Color, align: Align) -> f32 {
+        self.draw_layout(s, x, cy, w, size, weight, c, align, Face::Display)
     }
 
     pub fn icon(&self, glyph: char, cx: f32, cy: f32, size: f32, c: Color) {
         let w = size * 2.0;
-        self.draw_layout(&glyph.to_string(), cx - w / 2.0, cy, w, size, 400, c, Align::Center, true);
+        self.draw_layout(&glyph.to_string(), cx - w / 2.0, cy, w, size, 400, c, Align::Center, Face::Icon);
     }
 
-    fn draw_layout(&self, s: &str, x: f32, cy: f32, w: f32, size: f32, weight: u32, c: Color, align: Align, icon: bool) -> f32 {
-        let Some(l) = self.layout(s, size, weight, w, align, icon) else { return 0.0 };
+    fn draw_layout(&self, s: &str, x: f32, cy: f32, w: f32, size: f32, weight: u32, c: Color, align: Align, face: Face) -> f32 {
+        let Some(l) = self.layout(s, size, weight, w, align, face) else { return 0.0 };
         unsafe {
             self.rt.DrawTextLayout(pt(x, cy - size * 0.8), &l, self.solid(c), D2D1_DRAW_TEXT_OPTIONS_NONE);
             let mut m = DWRITE_TEXT_METRICS::default();
@@ -914,12 +979,90 @@ impl Gfx {
     }
 
     pub fn measure(&self, s: &str, size: f32, weight: u32) -> f32 {
-        let Some(l) = self.layout(s, size, weight, 4000.0, Align::Start, false) else { return 0.0 };
+        self.measure_face(s, size, weight, Face::Text)
+    }
+
+    pub fn measure_display(&self, s: &str, size: f32, weight: u32) -> f32 {
+        self.measure_face(s, size, weight, Face::Display)
+    }
+
+    fn measure_face(&self, s: &str, size: f32, weight: u32, face: Face) -> f32 {
+        let Some(l) = self.layout(s, size, weight, 4000.0, Align::Start, face) else { return 0.0 };
         let mut m = DWRITE_TEXT_METRICS::default();
         unsafe {
             let _ = l.GetMetrics(&mut m);
         }
         m.widthIncludingTrailingWhitespace
+    }
+}
+
+impl Drop for Gfx {
+    fn drop(&mut self) {
+        // Everything holding Inter goes first, then its loader is unregistered.
+        self.formats.borrow_mut().clear();
+        self.display = None;
+        if let Some(loader) = self.font_loader.take() {
+            unsafe {
+                let _ = self.dwrite.UnregisterFontFileLoader(&loader);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Face {
+    Text,
+    Icon,
+    Display,
+}
+
+/// Inter (SIL Open Font License, see assets/fonts/Inter-LICENSE.txt), shipped inside the
+/// exe and loaded from memory: nothing is installed on the system.
+const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+
+/// Loads Inter from memory. Returns the family name to ask for, the collection holding
+/// it, and the loader (which must be unregistered before the factory goes away).
+unsafe fn try_load_inter(dwrite: &IDWriteFactory) -> std::result::Result<(String, IDWriteFontCollection1, IDWriteInMemoryFontFileLoader), String> {
+    let step = |what: &str, e: windows::core::Error| format!("{what}: {e}");
+    let f5: IDWriteFactory5 = dwrite.cast().map_err(|e| step("IDWriteFactory5", e))?;
+    let loader = f5.CreateInMemoryFontFileLoader().map_err(|e| step("loader", e))?;
+    f5.RegisterFontFileLoader(&loader).map_err(|e| step("register loader", e))?;
+    let file = loader
+        .CreateInMemoryFontFileReference(&f5, INTER.as_ptr() as _, INTER.len() as u32, None)
+        .map_err(|e| step("font file", e))?;
+    let builder = f5.CreateFontSetBuilder().map_err(|e| step("set builder", e))?;
+    builder.AddFontFile(&file).map_err(|e| step("add file", e))?;
+    let set = builder.CreateFontSet().map_err(|e| step("font set", e))?;
+    let coll = f5.CreateFontCollectionFromFontSet(&set).map_err(|e| step("collection", e))?;
+    let mut names = Vec::new();
+    for i in 0..coll.GetFontFamilyCount() {
+        if let Ok(names_list) = coll.GetFontFamily(i).and_then(|f| f.GetFamilyNames()) {
+            let mut buf = [0u16; 64];
+            if names_list.GetString(0, &mut buf).is_ok() {
+                let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                names.push(String::from_utf16_lossy(&buf[..n]));
+            }
+        }
+    }
+    // The variable font shows up as "… Text" and "… Display" families (its optical sizes);
+    // the display cut is drawn for large type like the clock, as SF Display is on iOS.
+    let pick = names.iter().find(|n| n.contains("Display")).or(names.first()).cloned();
+    pick.map(|n| (n, coll.clone(), loader.clone())).ok_or_else(|| format!("no families in the collection ({names:?})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_inter_from_memory() {
+        unsafe {
+            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            match try_load_inter(&dw) {
+                Ok((name, _, _)) => println!("loaded family {name:?}"),
+                Err(e) => panic!("Inter didn't load: {e}"),
+            }
+        }
     }
 }
 

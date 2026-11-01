@@ -220,10 +220,12 @@ impl Setup {
         self.draw();
     }
 
+    /// Closing goes through WM_CLOSE so the window is destroyed after this call returns,
+    /// when WM_DESTROY can take down the app state cleanly.
     fn perform(&mut self, a: Act) {
         match a {
             Act::Close => unsafe {
-                let _ = DestroyWindow(self.hwnd);
+                let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             Act::Install => {
                 let job = ops::Shared::default();
@@ -235,7 +237,7 @@ impl Setup {
             Act::Launch => {
                 ops::launch();
                 unsafe {
-                    let _ = DestroyWindow(self.hwnd);
+                    let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
             }
             Act::AskRemove => self.go(Screen::ConfirmRemove),
@@ -247,7 +249,7 @@ impl Setup {
                 self.go(Screen::Working { removing: true });
             }
             Act::Cancel if self.uninstall_mode => unsafe {
-                let _ = DestroyWindow(self.hwnd);
+                let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             Act::Cancel => self.go(Screen::Welcome),
             Act::ToggleStart => self.opts.start_with_windows = !self.opts.start_with_windows,
@@ -522,6 +524,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         }
         WM_DESTROY => {
+            // Release the GPU and composition objects while the window still exists;
+            // doing it at program exit makes Windows report a crash.
+            let setup = SETUP.with(|c| c.try_borrow_mut().ok().and_then(|mut s| s.take()));
+            drop(setup);
             unsafe { PostQuitMessage(0) };
             return LRESULT(0);
         }

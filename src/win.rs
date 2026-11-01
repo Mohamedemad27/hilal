@@ -20,18 +20,77 @@ pub fn today() -> String {
     format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay)
 }
 
-/// Local time as "HH:MM".
-pub fn clock() -> String {
-    let t = unsafe { GetLocalTime() };
-    format!("{:02}:{:02}", t.wHour, t.wMinute)
+/// 0 = not read yet, 1 = 12-hour, 2 = 24-hour.
+static HOUR_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether Windows is set to a 12-hour clock (Settings > Time & language > Region).
+pub fn uses_12h() -> bool {
+    use std::sync::atomic::Ordering;
+    match HOUR_FORMAT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_ITIME};
+            let mut buf = [0u16; 4];
+            let n = unsafe { GetLocaleInfoEx(windows::core::PCWSTR::null(), LOCALE_ITIME, Some(&mut buf)) };
+            let twelve = n > 0 && buf[0] == '0' as u16;
+            HOUR_FORMAT.store(if twelve { 1 } else { 2 }, Ordering::Relaxed);
+            twelve
+        }
+    }
 }
 
-/// Local date as "Sat 31 Oct 2026".
+/// The user changed regional settings: read the clock format again.
+pub fn refresh_time_format() {
+    HOUR_FORMAT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A time of day in the user's format, split so the AM/PM can be drawn smaller:
+/// ("3:31", Some("PM")) on a 12-hour clock, ("15:31", None) on a 24-hour one.
+pub fn hm(hour: u16, minute: u16) -> (String, Option<&'static str>) {
+    if uses_12h() {
+        let h = match hour % 12 {
+            0 => 12,
+            h => h,
+        };
+        (format!("{h}:{minute:02}"), Some(if hour < 12 { "AM" } else { "PM" }))
+    } else {
+        (format!("{hour:02}:{minute:02}"), None)
+    }
+}
+
+/// `hm` as one string: "3:31 PM" or "15:31".
+pub fn hm_text(hour: u16, minute: u16) -> String {
+    match hm(hour, minute) {
+        (t, Some(ampm)) => format!("{t} {ampm}"),
+        (t, None) => t,
+    }
+}
+
+/// The current local time, split like `hm`.
+pub fn clock_parts() -> (String, Option<&'static str>) {
+    let t = unsafe { GetLocalTime() };
+    hm(t.wHour, t.wMinute)
+}
+
+/// The current local time in the user's format, e.g. "3:31 PM".
+pub fn clock() -> String {
+    let t = unsafe { GetLocalTime() };
+    hm_text(t.wHour, t.wMinute)
+}
+
+/// Local date as "Sun, Nov 1".
 pub fn date_long() -> String {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let t = unsafe { GetLocalTime() };
-    format!("{} {} {} {}", DAYS[t.wDayOfWeek as usize % 7], t.wDay, MONTHS[(t.wMonth as usize + 11) % 12], t.wYear)
+    format!("{}, {} {}", DAYS[t.wDayOfWeek as usize % 7], MONTHS[(t.wMonth as usize + 11) % 12], t.wDay)
+}
+
+/// Seconds since local midnight.
+pub fn seconds_of_day() -> u32 {
+    let t = unsafe { GetLocalTime() };
+    t.wHour as u32 * 3600 + t.wMinute as u32 * 60 + t.wSecond as u32
 }
 
 pub fn hour() -> u16 {
@@ -60,12 +119,58 @@ pub fn battery() -> Option<(u8, bool)> {
     Some((s.BatteryLifePercent, plugged))
 }
 
+/// Whether our windows are currently hidden from capture; the keyboard hook only steps
+/// in on screenshot keys while they are.
+pub static CAPTURE_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Hides a window from screenshots, recordings and desktop duplication (it still shows
 /// on the monitor). Glass windows need this so they don't capture themselves.
 pub fn exclude_from_capture(hwnd: windows::Win32::Foundation::HWND, on: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
+    CAPTURE_HIDDEN.store(on, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let _ = SetWindowDisplayAffinity(hwnd, if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE });
+    }
+}
+
+/// Marks key events we inject ourselves, so our keyboard hook lets them through.
+pub const INJECTED: usize = 0x4849_4C41; // "HILA"
+
+/// Modifier bits for `replay_keys`.
+pub const MOD_SHIFT: u8 = 1;
+pub const MOD_CTRL: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+pub const MOD_WIN: u8 = 8;
+
+/// Presses `vk` with the given modifiers, as if typed: modifiers that are still held are
+/// left alone, the others are pressed around the key.
+pub fn replay_keys(vk: u16, mods: u8) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let held = |k: VIRTUAL_KEY| unsafe { GetAsyncKeyState(k.0 as i32) } < 0;
+    // (Spelled out: this module's glob import has its own MOD_* hotkey constants.)
+    let wanted = [(crate::win::MOD_SHIFT, VK_SHIFT), (crate::win::MOD_CTRL, VK_CONTROL), (crate::win::MOD_ALT, VK_MENU), (crate::win::MOD_WIN, VK_LWIN)];
+    let press: Vec<VIRTUAL_KEY> = wanted
+        .iter()
+        .filter(|(bit, k)| mods & bit != 0 && !(held(*k) || (*k == VK_LWIN && held(VK_RWIN))))
+        .map(|(_, k)| *k)
+        .collect();
+    let input = |k: VIRTUAL_KEY, up: bool| {
+        let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+        if k == VK_SNAPSHOT || k == VK_LWIN {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: k, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: INJECTED } },
+        }
+    };
+    let key = VIRTUAL_KEY(vk);
+    let mut seq: Vec<INPUT> = press.iter().map(|k| input(*k, false)).collect();
+    seq.push(input(key, false));
+    seq.push(input(key, true));
+    seq.extend(press.iter().rev().map(|k| input(*k, true)));
+    unsafe {
+        SendInput(&seq, std::mem::size_of::<INPUT>() as i32);
     }
 }
 

@@ -16,6 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::gfx::{self, rgb, rgba, white, Align, Color, Gfx, Image, Rect, BLACK, WHITE};
 use crate::lyrics::{self, Lyrics};
 use crate::media::{Command, Media, Track};
+use crate::download::{self, Kind, Phase};
+use crate::prayer;
 use crate::store::{self, Store, Task};
 use crate::sysmon::{Snapshot, Sysmon};
 use crate::{shell, win};
@@ -34,6 +36,11 @@ const VIOLET: Color = rgb(0xa8, 0x7b, 0xff);
 const AMBER: Color = rgb(0xff, 0xc4, 0x3d);
 
 /// How long the notch stays open after the cursor leaves it.
+/// Pill buttons: label size, and the room on each side of their content.
+const PILL_TEXT: f32 = 11.5;
+const PILL_PAD: f32 = 11.0;
+/// How long a prayer time stays in the notch if nobody dismisses it.
+const PRAYER_SHOWN: Duration = Duration::from_secs(180);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
 /// How long a reminder holds the notch open on its own.
 const ALERT_OPEN: Duration = Duration::from_secs(8);
@@ -139,12 +146,15 @@ enum Page {
     Music,
     Pomo,
     Water,
+    Prayer,
+    Download,
     Shelf,
     Todo,
     System,
 }
 
-const PAGES: [Page; 6] = [Page::Music, Page::Pomo, Page::Water, Page::Shelf, Page::Todo, Page::System];
+const PAGES: [Page; 8] =
+    [Page::Music, Page::Pomo, Page::Water, Page::Prayer, Page::Download, Page::Shelf, Page::Todo, Page::System];
 
 impl Page {
     fn index(self) -> usize {
@@ -172,6 +182,20 @@ enum Action {
     WaterSettings(bool),
     WaterSub(usize),
     Bottle(i32),
+    WaterSnooze,
+    /// Step through the prayer cities by this much.
+    PrayerCity(i32),
+    PrayerAlerts,
+    PrayerDismiss,
+    /// Take the link from the clipboard.
+    DlPaste,
+    DlKind(Kind),
+    DlStart,
+    DlCancel,
+    /// Show the saved file in Explorer.
+    DlShow,
+    WaterRefilled,
+    WaterDrank,
     Goal(u32),
     FromH(i32),
     ToH(i32),
@@ -324,12 +348,39 @@ pub struct App {
     file_hover: bool,
     focusable: bool,
     pressed: Option<(Action, f32, f32)>,
+    /// The button being pressed or just let go, for its press feedback: (action, when it
+    /// went down, when it came up).
+    press_fx: Option<(Action, Instant, Option<Instant>)>,
     last_wheel: Instant,
     closed_sig: String,
     /// Window region currently set, in physical px [left, top, right, bottom].
     region: [i32; 4],
+    /// The settled shape the region currently outlines (None while it's the animation box).
+    region_shape: Option<Shape>,
     /// When the welcome started, and whether it's a "welcome back".
     welcome_at: Option<(Instant, bool)>,
+    /// While a screenshot is being taken: our windows show in the capture (with the glass
+    /// frozen, since a live capture would now include them), until this time.
+    capture_until: Option<Instant>,
+    /// A screenshot key we held back, to send once the windows are capturable.
+    replay: Option<(Instant, u16, u8)>,
+    /// A water reminder waiting for an answer (shown as a peek).
+    water_ask: Option<store::Ask>,
+    /// When the reminder appeared (its icon animates from then).
+    water_ask_at: Instant,
+    /// How many times its chime has played (like Nusa: on appearing, then twice more,
+    /// 12 s apart, while it goes unanswered).
+    water_chimes: u32,
+    /// A prayer time that just came (index into `prayer::NAMES`, its time in minutes),
+    /// shown as a peek until dismissed or for a few minutes.
+    prayer_ask: Option<(usize, i32)>,
+    prayer_ask_at: Instant,
+    /// The download page: the link, what to save it as, and the download under way.
+    dl_url: Option<String>,
+    dl_kind: Kind,
+    dl_job: Option<download::Job>,
+    /// A paste with no link on the clipboard, shown as a hint for a moment.
+    dl_no_link_at: Option<Instant>,
     /// Last time the windows were put back on top, and whether the notch is stepped
     /// aside for a full-screen app.
     top_check: Instant,
@@ -386,6 +437,13 @@ impl App {
             }
         }
         let surface = gfx.add_surface(overlay_hwnd, OV_W, OV_H, overlay_pos, false).unwrap_or(gfx::MAIN);
+        unsafe {
+            // Rounded like its pane, so tools that can't capture it draw a pill, not a box;
+            // a little rounder than the pane, so its anti-aliased corners aren't cut.
+            let d = (28.0 * k) as i32;
+            let rgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, (OV_W * k) as i32 + 1, (OV_H * k) as i32 + 1, d, d);
+            SetWindowRgn(overlay_hwnd, rgn, false);
+        }
         win::exclude_from_capture(hwnd, store.settings.glass);
         win::exclude_from_capture(overlay_hwnd, store.settings.glass);
         Self {
@@ -427,11 +485,24 @@ impl App {
             file_hover: false,
             focusable: false,
             pressed: None,
+            press_fx: None,
             last_wheel: now,
             closed_sig: String::new(),
             region: [0; 4],
+            region_shape: None,
             welcome_at: None,
             top_check: now,
+            water_ask: None,
+            water_ask_at: now,
+            water_chimes: 0,
+            prayer_ask: None,
+            prayer_ask_at: now,
+            dl_url: None,
+            dl_kind: Kind::Mp4,
+            dl_job: None,
+            dl_no_link_at: None,
+            capture_until: None,
+            replay: None,
             hidden_for_fullscreen: false,
             stats: Stats::new(now),
             frame_start: now,
@@ -452,6 +523,19 @@ impl App {
     pub fn set_minimal(&mut self, on: bool) {
         self.store.settings.minimal = on;
         self.store.save();
+    }
+
+    /// A screenshot key was pressed (and held back by the keyboard hook). Become visible
+    /// to capture for a few seconds, with the glass frozen on its last picture, then send
+    /// the key on once the compositor has caught up.
+    pub fn begin_screenshot(&mut self, vk: u16, mods: u8) {
+        let now = Instant::now();
+        win::exclude_from_capture(self.hwnd, false);
+        win::exclude_from_capture(self.overlay.hwnd, false);
+        // CAPTURE_HIDDEN tracks the "hidden" state; we're only visible for a moment.
+        win::CAPTURE_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.capture_until = Some(now + Duration::from_secs(6));
+        self.replay = Some((now + Duration::from_millis(45), vk, mods));
     }
 
     pub fn hide_in_fullscreen(&self) -> bool {
@@ -496,10 +580,37 @@ impl App {
         if self.store.water.roll_day() {
             self.store.save();
         }
-        if self.store.water.reminder_due() {
-            self.store.water.last_reminder = store::now_secs();
-            self.store.save();
-            self.alert(Page::Water);
+        // A water reminder shows as a peek in the notch and waits for an answer (not over
+        // the welcome, so its chime plays when it actually appears).
+        if self.water_ask.is_none() && !self.welcoming() {
+            if let Some(ask) = self.store.water.take_due() {
+                self.water_ask = Some(ask);
+                self.water_ask_at = now;
+                self.water_chimes = 1;
+                self.store.save();
+                crate::sound::play_chime();
+            }
+        }
+        // A prayer time shows the same way (after any water reminder), once per prayer.
+        if self.prayer_ask.is_none() && self.water_ask.is_none() && !self.welcoming() && self.store.prayer.alerts {
+            if let Some((day, i, at)) = prayer::started(self.store.prayer.city) {
+                if self.store.prayer.alerted != (day, i) {
+                    self.store.prayer.alerted = (day, i);
+                    self.store.save();
+                    self.prayer_ask = Some((i, at));
+                    self.prayer_ask_at = now;
+                    crate::sound::play_prayer();
+                }
+            }
+        }
+        crate::sound::tick();
+        if self.prayer_ask.is_some() && self.prayer_ask_at.elapsed() > PRAYER_SHOWN {
+            self.prayer_ask = None;
+            crate::sound::stop();
+        }
+        if self.water_ask.is_some() && self.water_chimes < 3 && self.water_ask_at.elapsed() >= Duration::from_secs(12 * self.water_chimes as u64) {
+            self.water_chimes += 1;
+            crate::sound::play_chime();
         }
         self.check_tasks();
         if self.pomo.finished() {
@@ -533,7 +644,10 @@ impl App {
         }
 
         let alerting = self.alert_until.is_some_and(|t| now < t);
-        if self.inside || self.form.is_some() || alerting {
+        // While a water reminder is up, hovering it doesn't open the page (its buttons are
+        // right there); an already-open notch stays open.
+        let hover_opens = self.inside && (!self.peeking() || self.open);
+        if hover_opens || self.form.is_some() || alerting {
             self.open = true;
             self.left_at = None;
         } else if self.open {
@@ -547,9 +661,26 @@ impl App {
         let target = self.target_shape();
         self.anim.retarget(target);
 
+        // A screenshot key was held back: let it through now that we're capturable, and
+        // go back to being hidden once the screenshot has surely been taken.
+        if let Some((at, vk, mods)) = self.replay {
+            if now >= at {
+                self.replay = None;
+                win::replay_keys(vk, mods);
+            }
+        }
+        if self.capture_until.is_some_and(|t| now >= t) {
+            self.capture_until = None;
+            if self.store.settings.glass {
+                win::exclude_from_capture(self.hwnd, true);
+                win::exclude_from_capture(self.overlay.hwnd, true);
+            }
+        }
+
         // Keep the glass fed with what's behind it; retry quietly if capture isn't available.
+        // During a screenshot the capture would see us, so the glass keeps its last image.
         let mut backdrop_changed = false;
-        if self.store.settings.glass {
+        if self.store.settings.glass && self.capture_until.is_none() {
             if !self.gfx.has_backdrop() && self.backdrop_retry.elapsed() > Duration::from_secs(3) {
                 self.backdrop_retry = now;
                 self.gfx.enable_backdrop();
@@ -581,7 +712,7 @@ impl App {
 
         let animating = !self.anim.done();
         let playing = self.track.as_ref().is_some_and(|t| t.playing);
-        let busy = animating || self.open || playing || self.welcoming() || self.file_hover;
+        let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking();
         let sig = self.closed_signature();
         if busy || backdrop_changed || sig != self.closed_sig {
             self.closed_sig = sig;
@@ -667,7 +798,7 @@ impl App {
         };
         g.text("FPS", 14.0, 15.0, 50.0, 9.5, 600, white(0.55), Align::Start);
         let fps = self.screen_fps.map_or_else(|| "—".to_owned(), |f| format!("{f:.0}"));
-        g.text(&fps, 13.0, 33.0, 64.0, 24.0, 700, c, Align::Start);
+        g.display(&fps, 13.0, 33.0, 64.0, 24.0, 700, c, Align::Start);
         // Headroom above the display's limit, so a maxed-out line doesn't fill the box.
         let top = self.refresh_hz.max(1) as f32 * 1.25;
         let history: Vec<f32> = self.fps_history.iter().map(|f| f / top).collect();
@@ -714,7 +845,15 @@ impl App {
         let dirty = self.gfx.screen_dirty.take();
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "  [screen] {:.0} changed frames/s  dirty {:?}  open={} presents {}", (f1 - f0) as f32 / t0.elapsed().as_secs_f32(), dirty, self.open, self.gfx.presents);
+            let _ = writeln!(
+                f,
+                "  [screen] {:.0} changed frames/s  dirty {:?}  open={} presents {}  font {:?}",
+                (f1 - f0) as f32 / t0.elapsed().as_secs_f32(),
+                dirty,
+                self.open,
+                self.gfx.presents,
+                self.gfx.display_family()
+            );
         }
         self.screen_log = (Instant::now(), f1);
     }
@@ -764,9 +903,23 @@ impl App {
             ((CX + s.w / 2.0 + s.e) * k).ceil().min(WIN_W * k) as i32,
             (s.h * k).ceil().min(WIN_H * k) as i32 + 1,
         ];
-        let grows = r[0] < self.region[0] || r[2] > self.region[2] || r[3] > self.region[3];
-        if r != self.region && (self.anim.done() || grows) {
+        if self.anim.done() {
+            // At rest the region is the notch's exact outline. Besides clicks, it's what
+            // a screenshot tool that can't see us paints black, so that comes out as a
+            // plain black notch rather than a box.
+            if self.region_shape != Some(cur) {
+                self.region_shape = Some(cur);
+                self.region = r;
+                unsafe {
+                    SetWindowRgn(self.hwnd, notch_region(cur, k), false);
+                }
+            }
+            return;
+        }
+        let grows = self.region_shape.is_some() || r[0] < self.region[0] || r[2] > self.region[2] || r[3] > self.region[3];
+        if r != self.region && grows {
             self.region = r;
+            self.region_shape = None;
             unsafe {
                 let rgn = CreateRectRgn(r[0], r[1], r[2], r[3]);
                 SetWindowRgn(self.hwnd, rgn, false);
@@ -787,13 +940,25 @@ impl App {
             }
             format!("mid-{}x{}", t.w as i32, t.h as i32)
         } else {
-            let page = ["music", "pomo", "water", "shelf", "todo", "system"][self.page.index()];
+            let page = ["music", "pomo", "water", "prayer", "download", "shelf", "todo", "system"][self.page.index()];
             let what = if !self.open {
-                if self.welcoming() { "welcome".to_owned() } else { "closed".to_owned() }
+                if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else { "closed".to_owned() }
             } else if self.page == Page::Water && self.water_settings {
                 "water-settings".to_owned()
             } else if self.page == Page::Music && self.lyrics_on {
                 "lyrics".to_owned()
+            } else if self.page == Page::Download {
+                // One picture per stage of a download.
+                let stage = match self.dl_job.as_ref().map(|j| j.status().phase) {
+                    None if self.dl_url.is_some() => "link",
+                    None => "empty",
+                    Some(Phase::Starting) => "starting",
+                    Some(Phase::Downloading) => "downloading",
+                    Some(Phase::Finishing) => "finishing",
+                    Some(Phase::Done(_)) => "done",
+                    Some(Phase::Failed(_)) => "failed",
+                };
+                format!("download-{stage}")
             } else {
                 page.to_owned()
             };
@@ -802,7 +967,12 @@ impl App {
             if self.page_at.elapsed() < Duration::from_millis(settle) {
                 return;
             }
-            what
+            // And the press feedback: one while held, one as the release ripple spreads.
+            match self.press_fx {
+                Some((a, _, None)) if self.press_k(a) >= 1.0 => format!("{what}-pressed"),
+                Some((a, _, Some(_))) if self.released_for(a).is_some_and(|t| t > 0.1) => format!("{what}-released"),
+                _ => what,
+            }
         };
         if key != self.dumped {
             self.dumped = key.clone();
@@ -842,7 +1012,7 @@ impl App {
         if self.open {
             return if self.page == Page::Music && self.lyrics_on { WIDE } else { PAGE };
         }
-        if self.welcoming() {
+        if self.welcoming() || self.peeking() {
             return PEEK;
         }
         if let Some(line) = self.closed_lyric() {
@@ -854,7 +1024,12 @@ impl App {
 
     /// The closed notch only needs redrawing when what it shows changes.
     fn closed_signature(&self) -> String {
-        format!("{}|{:?}|{}|{}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal())
+        format!("{}|{:?}|{}|{}|{:?}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal(), self.water_ask)
+    }
+
+    /// A reminder (water or prayer) is showing in the notch.
+    fn peeking(&self) -> bool {
+        self.water_ask.is_some() || self.prayer_ask.is_some()
     }
 
     fn alert(&mut self, page: Page) {
@@ -969,6 +1144,8 @@ impl App {
 
     pub fn mouse_down(&mut self, x: f32, y: f32) {
         self.pressed = self.region_at(x, y).map(|a| (a, x, y));
+        self.press_fx = self.pressed.map(|(a, _, _)| (a, Instant::now(), None));
+        self.draw();
         if self.form.is_some() && self.pressed.is_none() {
             // Clicking empty space inside the notch keeps the form; nothing to do.
         }
@@ -989,6 +1166,9 @@ impl App {
     }
 
     pub fn mouse_up(&mut self, x: f32, y: f32) {
+        if let Some((_, _, up)) = &mut self.press_fx {
+            up.get_or_insert_with(Instant::now);
+        }
         let Some((a, _, _)) = self.pressed.take() else { return };
         if self.region_at(x, y) == Some(a) {
             self.perform(a, x);
@@ -1006,6 +1186,11 @@ impl App {
         if self.page == Page::Todo && lx > 198.0 && y > 30.0 && self.store.tasks.len() > 3 {
             let max = self.store.tasks.len() - 3;
             self.todo_scroll = if down { (self.todo_scroll + 1).min(max) } else { self.todo_scroll.saturating_sub(1) };
+            return;
+        }
+        // Scrolling over the city pill steps through the cities.
+        if self.page == Page::Prayer && lx < 198.0 && y > 90.0 && y < 126.0 {
+            self.perform(Action::PrayerCity(if down { 1 } else { -1 }), 0.0);
             return;
         }
         if self.page == Page::Shelf && y > 30.0 && y < 120.0 && self.store.shelf.len() > 5 {
@@ -1100,19 +1285,91 @@ impl App {
             PomoToggle => self.pomo.toggle(),
             PomoReset => self.pomo.set_mode(self.pomo.brk),
             PomoMode(brk) => self.pomo.set_mode(brk),
-            WaterSwitch => w.enabled = !w.enabled,
-            Drink if w.enabled => {
-                w.drink();
-                self.alert_until = None;
+            WaterSwitch => {
+                w.enabled = !w.enabled;
+                // Turning reminders back on doesn't replay the ones missed meanwhile.
+                w.skip_past();
+                w.snooze_until = 0;
+                if !w.enabled {
+                    self.water_ask = None;
+                }
             }
-            Drink => {}
+            Drink => w.drink(),
+            PrayerCity(d) => {
+                let n = crate::prayer::CITIES.len() as i32;
+                let p = &mut self.store.prayer;
+                p.city = (p.city as i32 + d).rem_euclid(n) as usize;
+            }
+            PrayerAlerts => {
+                let p = &mut self.store.prayer;
+                p.alerts = !p.alerts;
+                if !p.alerts {
+                    self.prayer_ask = None;
+                    crate::sound::stop();
+                }
+            }
+            DlPaste => {
+                match download::clipboard_link() {
+                    Some(url) => {
+                        // A new link replaces a finished download; a running one keeps going.
+                        if !self.dl_job.as_ref().is_some_and(|j| j.running()) {
+                            self.dl_job = None;
+                        }
+                        self.dl_url = Some(url);
+                        self.dl_no_link_at = None;
+                    }
+                    None => self.dl_no_link_at = Some(Instant::now()),
+                }
+                save = false;
+            }
+            DlKind(k) => {
+                self.dl_kind = k;
+                save = false;
+            }
+            DlStart => {
+                if let Some(url) = &self.dl_url {
+                    self.dl_job = Some(download::start(url, self.dl_kind));
+                }
+                save = false;
+            }
+            DlCancel => {
+                self.dl_job = None;
+                save = false;
+            }
+            DlShow => {
+                if let Some(Phase::Done(path)) = self.dl_job.as_ref().map(|j| j.status().phase) {
+                    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+                }
+                save = false;
+            }
+            PrayerDismiss => {
+                self.prayer_ask = None;
+                crate::sound::stop();
+            }
             WaterSettings(on) => self.water_settings = on,
             WaterSub(i) => self.water_sub = i,
-            Bottle(d) => w.bottle_ml = (w.bottle_ml as i32 + d * 50).clamp(100, 2000) as u32,
+            Bottle(d) => {
+                w.bottle_ml = (w.bottle_ml as i32 + d * 50).clamp(250, 3000) as u32;
+                w.in_bottle_ml = w.in_bottle_ml.min(w.bottle_ml);
+            }
             Goal(ml) => w.goal_ml = ml,
-            FromH(d) => w.from_h = (w.from_h as i32 + 24 + d) as u32 % 24,
-            ToH(d) => w.to_h = (w.to_h as i32 + 24 + d) as u32 % 24,
+            FromH(d) => w.shift_start(d * 30),
+            ToH(d) => w.shift_end(d * 30),
             WaterReset => w.reset(),
+            WaterSnooze => {
+                w.snooze();
+                self.water_ask = None;
+            }
+            WaterRefilled => {
+                w.refill();
+                // A full bottle: the same reminder now asks you to drink (quietly: it was answered).
+                self.water_ask = Some(store::Ask::Drink);
+                self.water_chimes = 3;
+            }
+            WaterDrank => {
+                w.drink();
+                self.water_ask = None;
+            }
             ShelfOpen(i) => {
                 if let Some(p) = self.store.shelf.get(i) {
                     shell::open(p);
@@ -1195,7 +1452,51 @@ impl App {
 
     // ----- drawing ----------------------------------------------------------------------
 
+    /// How pressed the button for `a` looks, 0..1: it sinks in fast while held and eases
+    /// back out over a quarter second after release (so even a quick tap shows).
+    fn press_k(&self, a: Action) -> f32 {
+        let Some((pa, down, up)) = self.press_fx else { return 0.0 };
+        if pa != a {
+            return 0.0;
+        }
+        match up {
+            None => (down.elapsed().as_secs_f32() / 0.06).min(1.0),
+            Some(u) => (1.0 - u.elapsed().as_secs_f32() / 0.25).max(0.0).powi(2),
+        }
+    }
+
+    /// Seconds since the button for `a` was let go, while its release ripple runs.
+    fn released_for(&self, a: Action) -> Option<f32> {
+        match self.press_fx {
+            Some((pa, _, Some(u))) if pa == a && u.elapsed().as_secs_f32() < 0.4 => Some(u.elapsed().as_secs_f32()),
+            _ => None,
+        }
+    }
+
+    /// A round button's press feedback around (`cx`, `cy`): a soft disc while pressed and
+    /// a ripple on release. Returns the scale to draw its glyph at.
+    fn press_disc(&self, a: Action, cx: f32, cy: f32, r: f32) -> f32 {
+        let g = &self.gfx;
+        let k = self.press_k(a);
+        if k > 0.0 {
+            g.fill_circle(cx, cy, r * (0.8 + 0.2 * k), white(0.2 * k));
+        }
+        if let Some(t) = self.released_for(a) {
+            let p = t / 0.4;
+            g.stroke_circle(cx, cy, r * (1.0 + 0.45 * (1.0 - (1.0 - p).powi(2))), 1.2, white(0.3 * (1.0 - p)));
+        }
+        1.0 - 0.14 * k
+    }
+
     fn hit(&self, r: Rect, a: Action) {
+        // Small buttons without their own feedback get a soft highlight while pressed.
+        let own = matches!(a, Action::Previous | Action::PlayPause | Action::Next | Action::PagePrev | Action::PageNext | Action::SeekBar(..) | Action::Page(_) | Action::ShelfOpen(_));
+        if !own && r.w <= 140.0 && r.h <= 60.0 {
+            let k = self.press_k(a);
+            if k > 0.0 {
+                self.gfx.fill_rrect(r, (r.h / 2.0).min(10.0), white(0.14 * k));
+            }
+        }
         if self.gfx.fade.get() > 0.5 {
             let ox = self.ox.get();
             self.regions.borrow_mut().push((Rect::new(r.x + ox, r.y, r.w, r.h), a));
@@ -1251,7 +1552,11 @@ impl App {
                 g.fade.set(a);
                 self.ox.set(CX - PEEK.w / 2.0);
                 g.offset(self.ox.get());
-                self.welcome_view();
+                match (self.water_ask, self.prayer_ask) {
+                    (Some(ask), _) if !self.welcoming() => self.water_ask_view(ask),
+                    (None, Some((i, at))) if !self.welcoming() => self.prayer_ask_view(i, at),
+                    _ => self.welcome_view(),
+                }
             }
         }
         g.offset(0.0);
@@ -1298,6 +1603,88 @@ impl App {
         }
     }
 
+    /// The water reminder, in the 310-wide peek: an icon, what it wants, and two answers.
+    /// An empty bottle asks for a refill first; once refilled it asks you to drink.
+    fn water_ask_view(&self, ask: store::Ask) {
+        let g = &self.gfx;
+        let w = &self.store.water;
+        let (cx, cy) = (32.0, 30.0);
+        let icon = Rect::centered(cx, cy, 40.0, 40.0);
+        let lit = self.hovered(icon.grow(8.0));
+        let t = self.water_ask_at.elapsed().as_secs_f32();
+        let cyan = |a: f32| rgba(0x64, 0xdc, 0xfc, a);
+        // The ring settles into place as the reminder appears.
+        let k = 1.0 - (1.0 - (t / 0.3).min(1.0)).powi(3);
+        let ring_r = 13.0 + 6.0 * k;
+        g.fill_circle(cx, cy, ring_r, cyan(0.06));
+        g.stroke_circle(cx, cy, ring_r, 1.6, cyan(if lit { 0.95 } else { 0.45 }));
+        // A ripple leaves the icon every 0.46 s, growing and fading.
+        let phase = t % 0.46;
+        if phase < 0.42 {
+            let p = phase / 0.42;
+            let e = 1.0 - (1.0 - p).powi(2);
+            g.stroke_circle(cx, cy, 9.0 + 14.0 * e, 1.5, cyan(0.55 * (1.0 - p)));
+        }
+        // Every 1.35 s the icon wobbles from its base: a damped little shake.
+        let wobble = |amp: f32| {
+            let wt = t % 1.35;
+            if wt < 0.45 { amp * (std::f32::consts::TAU * 2.6 * wt).sin() * (-wt * 7.0).exp() } else { 0.0 }
+        };
+        let ox = self.ox.get();
+        let (title, sub, yes, yes_act) = match ask {
+            store::Ask::Refill => {
+                // A bottle: cap, body, and the water line inside.
+                g.rotate(ox, cx, cy + 11.0, wobble(22.0));
+                g.fill_rrect(Rect::centered(cx, cy - 9.5, 6.5, 4.0), 1.2, cyan(1.0));
+                g.stroke_rrect(Rect::new(cx - 6.5, cy - 6.5, 13.0, 17.5), 4.0, 1.8, cyan(1.0), false);
+                g.line(cx - 4.0, cy + 3.0, cx + 4.0, cy + 3.0, 1.6, cyan(1.0));
+                g.offset(ox);
+                ("Time to Refill", "Your bottle is probably empty".to_owned(), "Refilled", Action::WaterRefilled)
+            }
+            store::Ask::Drink => {
+                g.rotate(ox, cx, cy + 10.0, wobble(9.0));
+                g.fill_circle(cx, cy + 3.0, 7.5, cyan(1.0));
+                g.fill_poly(&[(cx, cy - 10.5), (cx + 7.2, cy + 1.6), (cx - 7.2, cy + 1.6)], cyan(1.0));
+                g.offset(ox);
+                ("Time to Drink", format!("Stay hydrated! · {} ml", w.per_ml()), "Drank", Action::WaterDrank)
+            }
+        };
+        // Buttons sized from their words, ending at the peek's right edge.
+        let bw = |s: &str| g.measure(s, PILL_TEXT, 600) + 2.0 * PILL_PAD;
+        let ok = Rect::new(301.0 - bw(yes), 16.0, bw(yes), 28.0);
+        let snooze = Rect::new(ok.x - 6.0 - bw("Snooze"), 16.0, bw("Snooze"), 28.0);
+        g.text(title, 60.0, 23.0, snooze.x - 64.0, 14.0, 700, WHITE, Align::Start);
+        g.text(&sub, 60.0, 40.0, snooze.x - 64.0, 10.5, 400, white(0.55), Align::Start);
+        g.fill_rrect(snooze, 14.0, white(if self.hovered(snooze) { 0.22 } else { 0.14 }));
+        g.text("Snooze", snooze.x, snooze.y + 14.0, snooze.w, PILL_TEXT, 600, WHITE, Align::Center);
+        self.hit(snooze, Action::WaterSnooze);
+        g.fill_rrect(ok, 14.0, if self.hovered(ok) { rgb(0x2a, 0x84, 0xec) } else { rgb(0x1d, 0x6f, 0xd8) });
+        g.text(yes, ok.x, ok.y + 14.0, ok.w, PILL_TEXT, 600, WHITE, Align::Center);
+        self.hit(ok, yes_act);
+    }
+
+    /// A prayer time has come: a glowing crescent, the prayer's name, and an OK.
+    fn prayer_ask_view(&self, i: usize, at: i32) {
+        let g = &self.gfx;
+        let (cx, cy) = (32.0, 30.0);
+        let t = self.prayer_ask_at.elapsed().as_secs_f32();
+        // The glow breathes slowly; the crescent rises into place as the peek appears.
+        let breath = 0.5 + 0.5 * (t * std::f32::consts::TAU / 2.4).sin();
+        g.radial(cx, cy, 22.0, 22.0, rgba(0xff, 0xc4, 0x3d, 0.18 + 0.16 * breath));
+        let k = 1.0 - (1.0 - (t / 0.45).min(1.0)).powi(3);
+        let my = cy + 6.0 * (1.0 - k);
+        g.fill_poly(&crescent(cx, my, 11.0, (5.0, -3.5), 9.2), AMBER);
+        g.fill_circle(cx + 9.5, my + 7.5, 1.3, rgba(0xff, 0xe0, 0x8a, 0.9 * k * breath));
+
+        let ok = Rect::new(301.0 - (g.measure("OK", PILL_TEXT, 600) + 4.0 * PILL_PAD), 16.0, g.measure("OK", PILL_TEXT, 600) + 4.0 * PILL_PAD, 28.0);
+        let time = win::hm_text((at / 60 % 24) as u16, (at % 60) as u16);
+        g.text(&format!("{} prayer", prayer::NAMES[i]), 60.0, 23.0, ok.x - 64.0, 14.0, 700, WHITE, Align::Start);
+        g.text(&format!("It's time to pray · {time}"), 60.0, 40.0, ok.x - 64.0, 10.5, 400, white(0.55), Align::Start);
+        g.fill_rrect(ok, 14.0, if self.hovered(ok) { rgba(0xff, 0xc4, 0x3d, 0.4) } else { rgba(0xff, 0xc4, 0x3d, 0.28) });
+        g.text("OK", ok.x, ok.y + 14.0, ok.w, PILL_TEXT, 600, AMBER, Align::Center);
+        self.hit(ok, Action::PrayerDismiss);
+    }
+
     /// Mascot eyes that glow, blink, then smile, next to a greeting.
     fn welcome_view(&self) {
         let g = &self.gfx;
@@ -1330,6 +1717,8 @@ impl App {
             Page::Pomo => self.pomo_page(),
             Page::Water if self.water_settings => self.water_settings_page(),
             Page::Water => self.water_page(),
+            Page::Prayer => self.prayer_page(),
+            Page::Download => self.download_page(),
             Page::Shelf => self.shelf_page(),
             Page::Todo => self.todo_page(),
             Page::System => self.system_page(),
@@ -1353,11 +1742,33 @@ impl App {
         self.clock_group(216.0, 19.0);
     }
 
+    /// The time the iOS way: digits in the display face, AM/PM smaller and dimmer beside
+    /// them, sharing a baseline. Draws starting at `x`; returns the width.
+    fn time(&self, x: f32, cy: f32, size: f32, weight: u32, c: Color) -> f32 {
+        let g = &self.gfx;
+        let (t, ampm) = win::clock_parts();
+        let tw = g.display(&t, x, cy, 200.0, size, weight, c, Align::Start);
+        let Some(ampm) = ampm else { return tw };
+        let small = size * 0.64;
+        let gap = size * 0.2;
+        // Smaller text sits a little lower so both share the baseline.
+        let aw = g.display(ampm, x + tw + gap, cy + (size - small) * 0.3, 60.0, small, 600, [c[0], c[1], c[2], c[3] * 0.72], Align::Start);
+        tw + gap + aw
+    }
+
+    fn time_width(&self, size: f32, weight: u32) -> f32 {
+        let g = &self.gfx;
+        let (t, ampm) = win::clock_parts();
+        // measure_display includes trailing space; the digits have none.
+        let tw = g.measure_display(&t, size, weight);
+        ampm.map_or(tw, |a| tw + size * 0.2 + g.measure_display(a, size * 0.64, 600))
+    }
+
     fn clock_group(&self, cx: f32, cy: f32) {
         let g = &self.gfx;
-        let (date, time) = (win::date_long(), win::clock());
-        let dw = g.measure(&date, 13.0, 400);
-        let tw = g.measure(&time, 13.0, 700);
+        let date = win::date_long();
+        let dw = g.measure_display(&date, 12.5, 500);
+        let tw = self.time_width(13.0, 700);
         let battery = win::battery();
         let ring = if battery.is_some() { 21.0 } else { 0.0 };
         let mut x = cx - (ring + dw + 6.0 + tw) / 2.0;
@@ -1373,16 +1784,24 @@ impl App {
             }
             x += ring;
         }
-        g.text(&date, x, cy, dw + 2.0, 13.0, 400, WHITE, Align::Start);
-        g.text(&time, x + dw + 6.0, cy, tw + 2.0, 13.0, 700, WHITE, Align::Start);
+        g.display(&date, x, cy, dw + 2.0, 12.5, 500, white(0.72), Align::Start);
+        self.time(x + dw + 7.0, cy, 13.0, 700, WHITE);
     }
 
     fn nav(&self) {
         let g = &self.gfx;
         for (cx, glyph, a) in [(22.0, '\u{E76B}', Action::PagePrev), (398.0, '\u{E76C}', Action::PageNext)] {
             let r = Rect::centered(cx, 69.0, 24.0, 24.0);
-            g.fill_circle(cx, 69.0, 11.0, white(if self.hovered(r) { 0.4 } else { 0.28 }));
+            let k = self.press_k(a);
+            let s = 1.0 - 0.14 * k;
+            g.fill_circle(cx, 69.0, 11.0 * s, white(if self.hovered(r) { 0.4 } else { 0.28 } + 0.3 * k));
+            if let Some(t) = self.released_for(a) {
+                let p = t / 0.4;
+                g.stroke_circle(cx, 69.0, 11.0 + 7.0 * (1.0 - (1.0 - p).powi(2)), 1.2, white(0.3 * (1.0 - p)));
+            }
+            g.scale_at(cx, 69.0, s);
             g.icon(glyph, cx, 69.5, 9.0, WHITE);
+            g.unscale();
             self.hit(r, a);
         }
         let active = self.page.index();
@@ -1396,19 +1815,29 @@ impl App {
         }
     }
 
+    /// The width a pill needs for its icon and label, with even room on both sides.
+    fn pill_w(&self, icon: Ico, label: &str) -> f32 {
+        let tw = if label.is_empty() { 0.0 } else { self.gfx.measure(label, PILL_TEXT, 500) };
+        let iw = if icon == Ico::None { 0.0 } else { 13.0 };
+        let gap = if iw > 0.0 && tw > 0.0 { 5.0 } else { 0.0 };
+        iw + gap + tw + 2.0 * PILL_PAD
+    }
+
     fn pill(&self, r: Rect, fill: Color, icon: Ico, label: &str, label_c: Color, a: Option<Action>) {
         let g = &self.gfx;
         let hover = a.is_some() && self.hovered(r);
         let fill = if hover { [fill[0], fill[1], fill[2], (fill[3] * 1.4).min(1.0)] } else { fill };
         g.fill_rrect(r, r.h / 2.0, fill);
-        let tw = if label.is_empty() { 0.0 } else { g.measure(label, 12.0, 400) };
+        let tw = if label.is_empty() { 0.0 } else { g.measure(label, PILL_TEXT, 500) };
         let iw = if icon == Ico::None { 0.0 } else { 13.0 };
-        let gap = if iw > 0.0 && tw > 0.0 { 6.0 } else { 0.0 };
-        let x = r.x + (r.w - iw - gap - tw) / 2.0;
+        let gap = if iw > 0.0 && tw > 0.0 { 5.0 } else { 0.0 };
+        // An icon looks lighter than text, so nudge the content toward it a touch.
+        let nudge = if iw > 0.0 && tw > 0.0 { -1.0 } else { 0.0 };
+        let x = r.x + (r.w - iw - gap - tw) / 2.0 + nudge;
         let cy = r.y + r.h / 2.0;
         self.draw_ico(icon, x + iw / 2.0, cy, label_c);
         if tw > 0.0 {
-            g.text(label, x + iw + gap, cy, tw + 2.0, 12.0, 400, label_c, Align::Start);
+            g.text(label, x + iw + gap, cy, tw + 4.0, PILL_TEXT, 500, label_c, Align::Start);
         }
         if let Some(a) = a {
             self.hit(r, a);
@@ -1467,7 +1896,8 @@ impl App {
             g.arc(x0 + 20.0, cy, 6.0, 0.0, frac * 360.0, 2.2, RED);
             g.text(&mmss(left.as_millis() as i64), x0 + s.w - 70.0, cy, 56.0, 13.0, 600, WHITE, Align::End);
         } else if !self.minimal() {
-            g.text(&win::clock(), x0, cy, s.w, 13.0, 600, white(0.9), Align::Center);
+            let w = self.time_width(14.5, 600);
+            self.time(x0 + (s.w - w) / 2.0, cy, 14.5, 600, white(0.95));
         }
     }
 
@@ -1547,8 +1977,8 @@ impl App {
 
         let (pos, end) = t.map_or((0, 0), |t| (t.position_ms(), t.end_ms()));
         let frac = if end > 0 { (pos as f32 / end as f32).clamp(0.0, 1.0) } else { 0.0 };
-        g.text(&mmss(pos), l.el_x, 92.0, 50.0, 12.0, 400, white(0.85), Align::Start);
-        g.text(&format!("-{}", mmss(end - pos)), l.rem_r - 60.0, 92.0, 60.0, 12.0, 400, white(0.85), Align::End);
+        g.display(&mmss(pos), l.el_x, 92.0, 50.0, 12.0, 500, white(0.85), Align::Start);
+        g.display(&format!("-{}", mmss(end - pos)), l.rem_r - 60.0, 92.0, 60.0, 12.0, 500, white(0.85), Align::End);
         let bar = Rect::new(l.bar_x, 90.0, l.bar_w, 4.0);
         g.fill_rrect(bar, 2.0, white(0.22));
         g.fill_rrect(Rect::new(bar.x, bar.y, bar.w * frac, 4.0), 2.0, WHITE);
@@ -1579,8 +2009,16 @@ impl App {
                 g.fill_poly(&[(x - dir * 4.0, cy - 5.5), (x + dir * 4.5, cy), (x - dir * 4.0, cy + 5.5)], c);
             }
         };
+        let s = self.press_disc(Action::Previous, l.prev, cy, 15.0);
+        g.scale_at(l.prev, cy, s);
         tri(l.prev + 4.0, -1.0);
+        g.unscale();
+        let s = self.press_disc(Action::Next, l.next, cy, 15.0);
+        g.scale_at(l.next, cy, s);
         tri(l.next - 4.0, 1.0);
+        g.unscale();
+        let s = self.press_disc(Action::PlayPause, l.play, cy, 16.0);
+        g.scale_at(l.play, cy, s);
         let playing = t.is_some_and(|t| t.playing);
         if playing {
             g.fill_rrect(Rect::new(l.play - 6.0, cy - 8.0, 4.4, 16.0), 1.5, c);
@@ -1588,6 +2026,7 @@ impl App {
         } else {
             g.fill_poly(&[(l.play - 5.0, cy - 8.5), (l.play + 8.0, cy), (l.play - 5.0, cy + 8.5)], c);
         }
+        g.unscale();
         self.hit(Rect::centered(l.prev, cy, 28.0, 24.0), Action::Previous);
         self.hit(Rect::centered(l.play, cy, 28.0, 24.0), Action::PlayPause);
         self.hit(Rect::centered(l.next, cy, 28.0, 24.0), Action::Next);
@@ -1611,7 +2050,7 @@ impl App {
         }
         g.icon('\u{E916}', cx, cy, 24.0, WHITE);
 
-        g.text(&mmss(left.as_millis() as i64 + 999), 200.0, 51.0, 130.0, 30.0, 700, WHITE, Align::Center);
+        g.display(&mmss(left.as_millis() as i64 + 999), 200.0, 51.0, 130.0, 30.0, 700, WHITE, Align::Center);
         let reset = Rect::centered(330.0, 50.0, 22.0, 22.0);
         g.icon('\u{E72C}', 330.0, 50.0, 13.0, white(if self.hovered(reset) { 1.0 } else { 0.8 }));
         self.hit(reset, Action::PomoReset);
@@ -1619,10 +2058,14 @@ impl App {
         g.text(label, 200.0, 75.0, 130.0, 12.0, 400, white(0.55), Align::Center);
 
         let sel = |on: bool| white(if on { 0.2 } else { 0.12 });
-        self.pill(Rect::new(146.0, 92.0, 84.0, 28.0), sel(self.pomo.brk), Ico::Glyph('\u{EC32}'), "Short Break", WHITE, Some(Action::PomoMode(true)));
+        // A row sized from its labels, ending at the page's right edge.
+        let brk_icon = Ico::Glyph('\u{EC32}');
+        let (w1, w2, w3) = (self.pill_w(brk_icon, "Short Break"), 46.0, self.pill_w(Ico::Target, "Focus Time"));
+        let x = 384.0 - (w1 + w2 + w3 + 12.0);
+        self.pill(Rect::new(x, 92.0, w1, 28.0), sel(self.pomo.brk), brk_icon, "Short Break", WHITE, Some(Action::PomoMode(true)));
         let icon = if self.pomo.running() { Ico::Pause } else { Ico::Play };
-        self.pill(Rect::new(239.0, 92.0, 52.0, 28.0), RED, icon, "", WHITE, Some(Action::PomoToggle));
-        self.pill(Rect::new(301.0, 92.0, 84.0, 28.0), sel(!self.pomo.brk), Ico::Target, "Focus Time", WHITE, Some(Action::PomoMode(false)));
+        self.pill(Rect::new(x + w1 + 6.0, 92.0, w2, 28.0), RED, icon, "", WHITE, Some(Action::PomoToggle));
+        self.pill(Rect::new(x + w1 + w2 + 12.0, 92.0, w3, 28.0), sel(!self.pomo.brk), Ico::Target, "Focus Time", WHITE, Some(Action::PomoMode(false)));
     }
 
     // ----- water ------------------------------------------------------------------------
@@ -1633,7 +2076,7 @@ impl App {
         self.header("Water ", Some(("Reminder", SKY)));
         let frac = w.drunk_ml as f32 / w.goal_ml.max(1) as f32;
 
-        let x = 44.0 + g.text(&liters(w.drunk_ml), 44.0, 48.0, 100.0, 26.0, 700, WHITE, Align::Start);
+        let x = 44.0 + g.display(&liters(w.drunk_ml), 44.0, 48.0, 100.0, 26.0, 700, WHITE, Align::Start);
         g.text(&format!("/ {} L", liters(w.goal_ml)), x + 4.0, 52.0, 80.0, 13.0, 400, white(0.55), Align::Start);
 
         // Reminder switch with a bell on the knob.
@@ -1651,11 +2094,11 @@ impl App {
         g.text(&pct, tx, 71.0, 60.0, 12.0, 700, SKY, Align::Start);
         tx += g.measure(&pct, 12.0, 700);
         let rest = if !w.enabled {
-            " · Off".to_owned()
+            " · Reminders off".to_owned()
         } else if frac >= 1.0 {
             " · Goal reached".to_owned()
         } else {
-            format!(" · Next {}", w.next_reminder())
+            w.next_reminder().map_or_else(String::new, |t| format!(" · Next {t}"))
         };
         g.text(&rest, tx, 71.0, 150.0, 12.0, 400, white(0.55), Align::Start);
 
@@ -1664,9 +2107,10 @@ impl App {
             g.linear(Rect::new(44.0, 80.0, 152.0 * frac.min(1.0), 5.0), 2.5, &[(0.0, rgb(0x66, 0xdb, 0xff)), (1.0, rgb(0x2d, 0x6b, 0xff))], false);
         }
 
-        let drink = if w.enabled { rgb(0x1d, 0x74, 0xd8) } else { white(0.1) };
-        self.pill(Rect::new(44.0, 98.0, 60.0, 26.0), drink, Ico::Drop, "Drink", if w.enabled { WHITE } else { white(0.4) }, Some(Action::Drink));
-        self.pill(Rect::new(110.0, 98.0, 74.0, 26.0), white(0.12), Ico::Glyph('\u{E713}'), "Settings", WHITE, Some(Action::WaterSettings(true)));
+        let gear = Ico::Glyph('\u{E713}');
+        let (w1, w2) = (self.pill_w(Ico::Drop, "Drink"), self.pill_w(gear, "Settings"));
+        self.pill(Rect::new(44.0, 98.0, w1, 26.0), rgb(0x1d, 0x74, 0xd8), Ico::Drop, "Drink", WHITE, Some(Action::Drink));
+        self.pill(Rect::new(44.0 + w1 + 6.0, 98.0, w2, 26.0), white(0.12), gear, "Settings", WHITE, Some(Action::WaterSettings(true)));
 
         g.line(207.0, 34.0, 207.0, 120.0, 1.0, white(0.12));
         for i in 0..2 {
@@ -1677,8 +2121,14 @@ impl App {
         if self.water_sub == 0 {
             let (cx, cy) = (293.0, 77.0);
             g.arc(cx, cy, 30.0, 210.0, 300.0, 5.0, white(0.12));
-            g.arc(cx, cy, 30.0, 210.0, 300.0 * frac.min(1.0), 5.0, SKY);
-            g.text(&format!("{:.0}", (frac * 100.0).min(999.0)), cx - 30.0, cy - 4.0, 60.0, 22.0, 700, WHITE, Align::Center);
+            let ring = if w.enabled { SKY } else { white(0.4) };
+            g.arc(cx, cy, 30.0, 210.0, 300.0 * frac.min(1.0), 5.0, ring);
+            if frac > 0.0 {
+                // A bead at the end of the arc.
+                let a = (210.0 + 300.0 * frac.min(1.0) - 90.0f32).to_radians();
+                g.fill_circle(cx + 30.0 * a.cos(), cy + 30.0 * a.sin(), 3.6, ring);
+            }
+            g.display(&format!("{:.0}", (frac * 100.0).min(999.0)), cx - 30.0, cy - 4.0, 60.0, 22.0, 700, WHITE, Align::Center);
             self.draw_ico(Ico::Drop, cx - 5.0, cy + 15.0, SKY);
             g.text("%", cx + 1.0, cy + 15.0, 20.0, 10.0, 600, WHITE, Align::Start);
         } else {
@@ -1690,22 +2140,35 @@ impl App {
         let g = &self.gfx;
         let w = &self.store.water;
         let (x0, y0, cw, ch) = (220.0, 56.0, 112.0, 50.0);
-        let top = w.goal_ml.max(2000) as f32 * 2.0;
-        for (i, label) in [(0.0, liters_ml(top as u32)), (0.5, liters_ml(top as u32 / 2)), (1.0, "0 ml".to_owned())] {
+        let top = (w.goal_ml * 2).max(1) as f32;
+        for (i, ml) in [(0.0, w.goal_ml * 2), (0.5, w.goal_ml), (1.0, 0)] {
             let y = y0 + ch * i;
             g.line(x0, y, x0 + cw + 6.0, y, 1.0, white(0.14));
+            let label = if ml == 0 { "0 ml".to_owned() } else { ml.to_string() };
             g.text(&label, x0 + cw + 10.0, y, 40.0, 9.5, 400, white(0.5), Align::Start);
         }
-        let span = ((w.to_h + 24 - w.from_h) % 24).max(1);
-        let step = cw / span as f32;
-        for k in 0..span {
-            let hour = (w.from_h + k) % 24;
-            let ml = w.ml_in_hour(hour) as f32;
-            let x = x0 + k as f32 * step + (step - 7.0).max(0.0) / 2.0;
-            let h = (ml / top * ch).min(ch);
-            g.fill_rrect(Rect::new(x, y0 + ch - h.max(3.0), 7.0_f32.min(step - 1.0), h.max(3.0)), 3.5, if ml > 0.0 { SKY } else { white(0.1) });
-            if k == 0 || k == span - 1 {
-                g.text(&format!("{hour:02}"), x - 6.0, y0 + ch + 10.0, 20.0, 9.5, 400, white(0.5), Align::Center);
+        let hours = w.chart_hours();
+        let now_h = win::hour() as u32;
+        let step = cw / hours.len() as f32;
+        let bar_w = 7.0_f32.min(step - 2.0).max(2.0);
+        for (k, &hour) in hours.iter().enumerate() {
+            let ml = w.ml_in_hour(hour);
+            let x = x0 + k as f32 * step + (step - bar_w) / 2.0;
+            let h = (ml as f32 / top * ch).clamp(3.0, ch);
+            let current = hour == now_h;
+            let c = if current { SKY } else if ml > 0 { rgba(0x3f, 0xb4, 0xff, 0.55) } else { white(0.1) };
+            g.fill_rrect(Rect::new(x, y0 + ch - h, bar_w, h), bar_w / 2.0, c);
+            if current && ml > 0 {
+                // A bubble with this hour's amount above its bar.
+                let label = format!("{ml} ml");
+                let bw = g.measure(&label, 9.5, 700) + 12.0;
+                let bx = (x + bar_w / 2.0 - bw / 2.0).clamp(x0 - 4.0, x0 + cw + 6.0 - bw);
+                let by = (y0 + ch - h - 20.0).max(y0 - 16.0);
+                g.fill_rrect(Rect::new(bx, by, bw, 15.0), 7.5, rgb(0x1d, 0x74, 0xd8));
+                g.text(&label, bx, by + 7.5, bw, 9.5, 700, WHITE, Align::Center);
+            }
+            if hours.len() <= 4 || k == 0 || k == hours.len() - 1 {
+                g.text(&format!("{hour:02}"), x + bar_w / 2.0 - 10.0, y0 + ch + 10.0, 20.0, 9.5, 400, white(0.5), Align::Center);
             }
         }
     }
@@ -1724,7 +2187,7 @@ impl App {
             g.text(label, 22.0, y, 60.0, 13.0, 400, WHITE, Align::Start);
         }
         self.stepper(86.0, 162.0, 50.0, &format!("{} ml", w.bottle_ml), Action::Bottle(-1), Action::Bottle(1));
-        g.text(&format!("{} ml each", w.bottle_ml), 180.0, 50.0, 110.0, 9.5, 400, white(0.5), Align::Start);
+        g.text(&format!("{} ml each", w.per_ml()), 180.0, 50.0, 110.0, 9.5, 400, white(0.5), Align::Start);
 
         for (i, ml) in [1500u32, 2000, 2500, 3000].into_iter().enumerate() {
             let r = Rect::new(78.0 + i as f32 * 54.5, 69.0, 48.0, 22.0);
@@ -1734,16 +2197,17 @@ impl App {
             self.hit(r, Action::Goal(ml));
         }
 
-        self.stepper(86.0, 162.0, 110.0, &format!("{:02}:00", w.from_h), Action::FromH(-1), Action::FromH(1));
+        let hm = |m: u32| win::hm_text((m / 60) as u16, (m % 60) as u16);
+        self.stepper(86.0, 162.0, 110.0, &hm(w.from_min), Action::FromH(-1), Action::FromH(1));
         g.text("to", 174.0, 110.0, 20.0, 12.0, 400, white(0.55), Align::Center);
-        self.stepper(205.0, 282.0, 110.0, &format!("{:02}:00", w.to_h), Action::ToH(-1), Action::ToH(1));
+        self.stepper(205.0, 282.0, 110.0, &hm(w.to_min), Action::ToH(-1), Action::ToH(1));
 
         let card = Rect::new(306.0, 36.0, 92.0, 64.0);
         g.fill_rrect(card, 10.0, white(0.08));
         let n = w.reminders();
         g.text(&n.to_string(), card.x, 52.0, card.w, 20.0, 700, SKY, Align::Center);
         g.text("reminders", card.x, 67.0, card.w, 9.5, 400, white(0.55), Align::Center);
-        let refills = format!("{}", n.saturating_sub(1));
+        let refills = w.refills().to_string();
         let rw = g.measure(&refills, 13.0, 700) + 4.0 + g.measure("refills", 9.5, 400);
         let rx = card.x + (card.w - rw) / 2.0;
         let used = g.text(&refills, rx, 87.0, 30.0, 13.0, 700, SKY, Align::Start);
@@ -1843,6 +2307,170 @@ impl App {
         }
     }
 
+    // ----- prayer times -----------------------------------------------------------------
+
+    fn prayer_page(&self) {
+        let g = &self.gfx;
+        self.header("Prayer ", Some(("Times", AMBER)));
+        let n = prayer::CITIES.len();
+        let (city, lat, lon) = prayer::CITIES[self.store.prayer.city.min(n - 1)];
+        let (y, m, d, tz) = prayer::today();
+        let mut t = prayer::minutes(prayer::times(y, m, d, lat, lon, tz));
+        let mut now = win::seconds_of_day() as i32;
+
+        // The next of the five prayers (sunrise is listed but isn't one), and the one before
+        // it, in seconds since today's midnight. After Isha, the next is tomorrow's Fajr.
+        const FIVE: [usize; 5] = [0, 2, 3, 4, 5];
+        let (next, next_at, prev_at) = match FIVE.iter().position(|&i| t[i] * 60 > now) {
+            Some(k) => {
+                let prev = if k == 0 { (t[5] - 1440) * 60 } else { t[FIVE[k - 1]] * 60 };
+                (FIVE[k], t[FIVE[k]] * 60, prev)
+            }
+            None => {
+                // Past Isha: show tomorrow's day, counting from a midnight already behind us.
+                let (y2, m2, d2) = prayer::next_day(y, m, d);
+                let isha = t[5];
+                t = prayer::minutes(prayer::times(y2, m2, d2, lat, lon, tz));
+                now -= 86400;
+                (0, t[0] * 60, (isha - 1440) * 60)
+            }
+        };
+
+        // Left: the next prayer, when, how long until it, and the city.
+        g.text("Next prayer", 44.0, 41.0, 150.0, 10.5, 500, white(0.55), Align::Start);
+        let nw = g.text(prayer::NAMES[next], 44.0, 60.0, 150.0, 21.0, 700, WHITE, Align::Start);
+        let at = next_at / 60 % 1440;
+        g.display(&win::hm_text((at / 60) as u16, (at % 60) as u16), 44.0 + nw + 8.0, 61.5, 100.0, 12.5, 600, white(0.6), Align::Start);
+        let left = (next_at - now).max(0);
+        let until = if left >= 3600 { format!("in {}h {}m", left / 3600, left / 60 % 60) } else { format!("in {}m {:02}s", left / 60, left % 60) };
+        g.display(&until, 44.0, 78.0, 150.0, 11.5, 600, AMBER, Align::Start);
+        let frac = ((now - prev_at) as f32 / (next_at - prev_at).max(1) as f32).clamp(0.0, 1.0);
+        g.fill_rrect(Rect::new(44.0, 88.0, 152.0, 4.0), 2.0, white(0.15));
+        if frac > 0.0 {
+            g.linear(Rect::new(44.0, 88.0, 152.0 * frac, 4.0), 2.0, &[(0.0, rgb(0xff, 0xe0, 0x8a)), (1.0, AMBER)], false);
+        }
+        let pin = Ico::Glyph('\u{E81D}');
+        let cw = self.pill_w(pin, city).min(152.0 - 34.0 - 6.0);
+        self.pill(Rect::new(44.0, 99.0, cw, 24.0), white(0.12), pin, city, WHITE, Some(Action::PrayerCity(1)));
+        // The bell: an alert at each prayer time, on or off.
+        let on = self.store.prayer.alerts;
+        let bell = Ico::Glyph(if on { '\u{EA8F}' } else { '\u{E7ED}' });
+        let fill = if on { rgba(0xff, 0xc4, 0x3d, 0.28) } else { white(0.12) };
+        self.pill(Rect::new(44.0 + cw + 6.0, 99.0, 34.0, 24.0), fill, bell, "", if on { AMBER } else { white(0.6) }, Some(Action::PrayerAlerts));
+
+        // Right: all six times; the next one lit, the ones gone by dimmed.
+        for (i, name) in prayer::NAMES.iter().enumerate() {
+            let cell = Rect::new(204.0 + (i % 3) as f32 * 61.0, 34.0 + (i / 3) as f32 * 45.0, 58.0, 41.0);
+            let is_next = i == next;
+            let past = t[i] * 60 <= now && !is_next;
+            if is_next {
+                g.fill_rrect(cell, 11.0, rgba(0xff, 0xc4, 0x3d, 0.16));
+                g.stroke_rrect(cell, 11.0, 1.2, rgba(0xff, 0xc4, 0x3d, 0.55), false);
+            } else {
+                g.fill_rrect(cell, 11.0, white(0.07));
+            }
+            let name_c = if is_next { AMBER } else { white(if past { 0.35 } else { 0.6 }) };
+            g.text(name, cell.x, cell.y + 13.0, cell.w, 10.0, 600, name_c, Align::Center);
+            let (hm, ampm) = win::hm((t[i] / 60 % 24) as u16, (t[i] % 60) as u16);
+            let c = white(if past { 0.45 } else { 1.0 });
+            let tw = g.measure_display(&hm, 13.5, 700);
+            let aw = ampm.map_or(0.0, |a| g.measure_display(a, 8.5, 600) + 2.5);
+            let x = cell.x + (cell.w - tw - aw) / 2.0;
+            let cy = cell.y + 28.0;
+            g.display(&hm, x, cy, tw + 2.0, 13.5, 700, c, Align::Start);
+            if let Some(a) = ampm {
+                g.display(a, x + tw + 2.5, cy + 1.5, aw, 8.5, 600, [c[0], c[1], c[2], c[3] * 0.72], Align::Start);
+            }
+        }
+    }
+
+    // ----- video download ---------------------------------------------------------------
+
+    fn download_page(&self) {
+        let g = &self.gfx;
+        self.header("Video ", Some(("Download", VIOLET)));
+        let status = self.dl_job.as_ref().map(|j| j.status());
+        let running = self.dl_job.as_ref().is_some_and(|j| j.running());
+
+        // The link (or, once known, the video's title) and the paste button.
+        let field = Rect::new(44.0, 34.0, 256.0, 28.0);
+        g.fill_rrect(field, 9.0, white(0.08));
+        let title = status.as_ref().map(|s| s.title.as_str()).filter(|t| !t.is_empty());
+        let (text, c, weight) = match (title, &self.dl_url) {
+            (Some(t), _) => (t.to_owned(), WHITE, 600),
+            (None, Some(u)) => (u.trim_start_matches("https://").trim_start_matches("www.").to_owned(), white(0.8), 400),
+            (None, None) if self.dl_no_link_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) => {
+                ("No link on the clipboard. Copy one first".to_owned(), rgb(0xff, 0x9a, 0x8a), 400)
+            }
+            (None, None) => ("Copy a video link, then press Paste".to_owned(), white(0.4), 400),
+        };
+        g.text(&text, field.x + 11.0, field.y + 14.0, field.w - 22.0, 11.5, weight, c, Align::Start);
+        let paste = Ico::Glyph('\u{E77F}');
+        let pw = self.pill_w(paste, "Paste");
+        self.pill(Rect::new(384.0 - pw, 34.0, pw, 28.0), white(0.14), paste, "Paste", WHITE, Some(Action::DlPaste));
+
+        // MP3 or MP4, and the button.
+        let mut x = 44.0;
+        for (k, icon, label) in [(Kind::Mp3, '\u{E8D6}', "MP3"), (Kind::Mp4, '\u{E714}', "MP4")] {
+            let w = self.pill_w(Ico::Glyph(icon), label);
+            let on = self.dl_kind == k;
+            let fill = if on { rgba(0xa8, 0x7b, 0xff, 0.38) } else { white(0.08) };
+            let act = (!running).then_some(Action::DlKind(k));
+            self.pill(Rect::new(x, 72.0, w, 28.0), fill, Ico::Glyph(icon), label, if on { WHITE } else { white(0.6) }, act);
+            x += w + 6.0;
+        }
+        let (icon, label, fill, act) = if running {
+            (Ico::Glyph('\u{E711}'), "Cancel", white(0.14), Some(Action::DlCancel))
+        } else if self.dl_url.is_some() {
+            (Ico::Glyph('\u{E896}'), "Download", rgb(0x1d, 0x74, 0xd8), Some(Action::DlStart))
+        } else {
+            (Ico::Glyph('\u{E896}'), "Download", white(0.06), None)
+        };
+        let bw = self.pill_w(icon, label);
+        let label_c = if act.is_some() { WHITE } else { white(0.35) };
+        self.pill(Rect::new(384.0 - bw, 72.0, bw, 28.0), fill, icon, label, label_c, act);
+
+        // How it's going.
+        let Some(s) = status else {
+            g.text("Saves to Downloads\\Hilal", 44.0, 118.0, 340.0, 10.5, 400, white(0.4), Align::Start);
+            return;
+        };
+        let what = if self.dl_kind == Kind::Mp3 { "MP3" } else { "MP4" };
+        let bar = |frac: f32, c: Color| {
+            g.fill_rrect(Rect::new(44.0, 106.0, 340.0, 4.0), 2.0, white(0.12));
+            if frac > 0.0 {
+                g.fill_rrect(Rect::new(44.0, 106.0, 340.0 * frac, 4.0), 2.0, c);
+            }
+        };
+        match &s.phase {
+            Phase::Starting => {
+                bar(0.0, VIOLET);
+                g.text("Getting the video\u{2026}", 44.0, 120.0, 340.0, 10.5, 500, white(0.6), Align::Start);
+            }
+            Phase::Downloading => {
+                bar(s.progress, VIOLET);
+                g.text(&format!("Downloading  {:.0}%", s.progress * 100.0), 44.0, 120.0, 340.0, 10.5, 500, white(0.75), Align::Start);
+            }
+            Phase::Finishing => {
+                bar(1.0, VIOLET);
+                let msg = if self.dl_kind == Kind::Mp3 { "Making the MP3\u{2026}" } else { "Joining picture and sound\u{2026}" };
+                g.text(msg, 44.0, 120.0, 340.0, 10.5, 500, white(0.75), Align::Start);
+            }
+            Phase::Done(_) => {
+                bar(1.0, GREEN);
+                g.text(&format!("Saved as {what} in Downloads\\Hilal"), 44.0, 120.0, 260.0, 10.5, 500, GREEN, Align::Start);
+                let show = Rect::new(310.0, 112.0, 74.0, 16.0);
+                let c = if self.hovered(show) { WHITE } else { white(0.7) };
+                g.text("Show in folder", show.x, 120.0, show.w, 10.5, 600, c, Align::End);
+                self.hit(show, Action::DlShow);
+            }
+            Phase::Failed(e) => {
+                bar(0.0, RED);
+                g.text(e, 44.0, 120.0, 340.0, 10.5, 500, rgb(0xff, 0x8a, 0x8a), Align::Start);
+            }
+        }
+    }
+
     // ----- to-do ------------------------------------------------------------------------
 
     fn todo_page(&self) {
@@ -1850,18 +2478,23 @@ impl App {
         let tasks = &self.store.tasks;
         self.header("Todo", Some(("List", GREEN)));
         let done = tasks.iter().filter(|t| t.done).count();
-        g.text(&format!("{done}/{}", tasks.len()), 44.0, 48.0, 140.0, 28.0, 700, WHITE, Align::Start);
+        g.display(&format!("{done}/{}", tasks.len()), 44.0, 48.0, 140.0, 28.0, 700, WHITE, Align::Start);
         g.text("Task Done Today", 44.0, 80.0, 150.0, 12.0, 400, white(0.55), Align::Start);
 
         let adding = self.form.as_ref().is_some_and(|f| f.editing.is_none());
-        self.pill(Rect::new(42.0, 94.0, 74.0, 26.0), if adding { rgba(0x2f, 0xd0, 0x6b, 0.25) } else { white(0.12) }, Ico::Plus, "Add Task", WHITE, Some(Action::TodoAdd));
+        let w1 = self.pill_w(Ico::Plus, "Add Task");
+        let pencil = Ico::Glyph('\u{E70F}');
+        // The edit pill keeps its label when both fit beside the task list, else just its pencil.
+        let edit_label = if 42.0 + w1 + 6.0 + self.pill_w(pencil, "Edit Task") <= 194.0 { "Edit Task" } else { "" };
+        let w2 = if edit_label.is_empty() { 34.0 } else { self.pill_w(pencil, edit_label) };
+        self.pill(Rect::new(42.0, 94.0, w1, 26.0), if adding { rgba(0x2f, 0xd0, 0x6b, 0.25) } else { white(0.12) }, Ico::Plus, "Add Task", WHITE, Some(Action::TodoAdd));
         let can_edit = !tasks.is_empty();
         let edit_fill = if self.edit_mode { white(0.25) } else { white(if can_edit { 0.12 } else { 0.06 }) };
         self.pill(
-            Rect::new(122.0, 94.0, 74.0, 26.0),
+            Rect::new(42.0 + w1 + 6.0, 94.0, w2, 26.0),
             edit_fill,
-            Ico::Glyph('\u{E70F}'),
-            "Edit Task",
+            pencil,
+            edit_label,
             if can_edit { WHITE } else { white(0.35) },
             can_edit.then_some(Action::TodoEditMode),
         );
@@ -1946,7 +2579,7 @@ impl App {
                 g.arc(cx, cy, 21.0, 0.0, v.clamp(0.0, 1.0) * 360.0, 5.0, c);
             }
             let value = if ok { format!("{:.0}%", v * 100.0) } else { "—".to_owned() };
-            g.text(&value, cx - 24.0, cy, 48.0, 12.5, 700, WHITE, Align::Center);
+            g.display(&value, cx - 24.0, cy, 48.0, 12.5, 700, WHITE, Align::Center);
             g.text(label, cx - 30.0, 99.0, 60.0, 10.5, 600, white(0.85), Align::Center);
             g.text(&sub, cx - 30.0, 112.0, 60.0, 9.0, 400, white(0.5), Align::Center);
         }
@@ -1967,8 +2600,8 @@ impl App {
             Some(_) => format!("{:.0}", shown[3]),
             None => "—".to_owned(),
         };
-        let fw = g.measure(&fps, 26.0, 700);
-        g.text(&fps, x, 57.0, w, 26.0, 700, WHITE, Align::Start);
+        let fw = g.measure_display(&fps, 26.0, 700);
+        g.display(&fps, x, 57.0, w, 26.0, 700, WHITE, Align::Start);
         let note = if self.screen_fps.is_some() { "on screen" } else { "unavailable" };
         g.text(note, x + fw + 6.0, 61.0, w - fw - 6.0, 10.0, 400, white(0.5), Align::Start);
         let top = self.refresh_hz.max(1) as f32 * 1.25;
@@ -2034,6 +2667,33 @@ enum Ico {
     Play,
     Pause,
     Plus,
+}
+
+/// A crescent's outline: the disc of radius `r` at (`cx`, `cy`) less a disc of radius
+/// `cut` shifted by `off` from it.
+fn crescent(cx: f32, cy: f32, r: f32, off: (f32, f32), cut: f32) -> Vec<(f32, f32)> {
+    let inside_cut = |x: f32, y: f32| (x - cx - off.0).hypot(y - cy - off.1) < cut;
+    // The middle of the lit part faces away from the cut.
+    let mid = (-off.1).atan2(-off.0);
+    let mut span = 0.0f32;
+    while span < std::f32::consts::PI && !inside_cut(cx + r * (mid + span).cos(), cy + r * (mid + span).sin()) {
+        span += 0.01;
+    }
+    // Where the outer edge meets the cut, seen from the cut's centre.
+    let (ex, ey) = (cx + r * (mid + span).cos() - cx - off.0, cy + r * (mid + span).sin() - cy - off.1);
+    let psi = (ey.atan2(ex) - mid).rem_euclid(std::f32::consts::TAU);
+    let psi = if psi > std::f32::consts::PI { std::f32::consts::TAU - psi } else { psi };
+    let n = 40;
+    let mut pts = Vec::with_capacity(2 * n + 2);
+    for k in 0..=n {
+        let a = mid - span + 2.0 * span * k as f32 / n as f32;
+        pts.push((cx + r * a.cos(), cy + r * a.sin()));
+    }
+    for k in 0..=n {
+        let a = mid + psi - 2.0 * psi * k as f32 / n as f32;
+        pts.push((cx + off.0 + cut * a.cos(), cy + off.1 + cut * a.sin()));
+    }
+    pts
 }
 
 /// Where the player pieces sit: the normal 420-wide page, or the left half of the lyrics view.
@@ -2145,10 +2805,6 @@ fn liters(ml: u32) -> String {
     format!("{:.1}", ml as f32 / 1000.0)
 }
 
-fn liters_ml(ml: u32) -> String {
-    ml.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2214,4 +2870,36 @@ fn foreground_is_fullscreen(ours: &[HWND]) -> bool {
         let m = info.rcMonitor;
         r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
     }
+}
+
+/// The notch's outline (ears, sides, rounded bottom) as a window region, in physical px.
+/// Regions have no anti-aliasing: they cut on whole pixels. So this one runs `PAD` dp
+/// outside the drawn shape, leaving its soft edge intact, and only the transparent
+/// margin past it gets cut.
+fn notch_region(s: Shape, k: f32) -> windows::Win32::Graphics::Gdi::HRGN {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    use windows::Win32::Graphics::Gdi::{CreatePolygonRgn, WINDING};
+    const PAD: f32 = 2.0;
+    let rr0 = s.r.min(s.h / 2.0).min(s.w / 2.0).max(0.0);
+    let e0 = s.e.min(s.h - rr0).max(0.0);
+    // Offsetting the outline outward: sides and bottom move out, the bottom corners keep
+    // their centers (radius grows), the concave ears keep theirs (radius shrinks).
+    let (l, r, h) = (CX - s.w / 2.0 - PAD, CX + s.w / 2.0 + PAD, s.h + PAD);
+    let rr = rr0 + PAD;
+    let e = (e0 - PAD).max(0.0);
+    let mut pts = Vec::new();
+    let arc = |cx: f32, cy: f32, rad: f32, from: f32, to: f32| {
+        (0..=10).map(move |i| {
+            let a = from + (to - from) * i as f32 / 10.0;
+            POINT { x: ((cx + rad * a.cos()) * k).round() as i32, y: ((cy + rad * a.sin()) * k).round() as i32 }
+        })
+    };
+    let (el, er, ey) = (l + PAD - e0, r - PAD + e0, e0); // the ears' (unchanged) centers
+    pts.push(POINT { x: ((el - PAD) * k).floor() as i32, y: 0 });
+    pts.extend(arc(el, ey, e, -FRAC_PI_2, 0.0)); // left ear, from the top edge down to the side
+    pts.extend(arc(l + rr, h - rr, rr, PI, FRAC_PI_2)); // bottom-left corner
+    pts.extend(arc(r - rr, h - rr, rr, FRAC_PI_2, 0.0)); // bottom-right corner
+    pts.extend(arc(er, ey, e, PI, PI + FRAC_PI_2)); // right ear, back up to the top edge
+    pts.push(POINT { x: ((er + PAD) * k).ceil() as i32, y: 0 });
+    unsafe { CreatePolygonRgn(&pts, WINDING) }
 }

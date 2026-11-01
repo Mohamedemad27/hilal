@@ -80,7 +80,7 @@ pub fn install(opts: Options, job: Shared) {
             let dir = install_dir();
             std::fs::create_dir_all(&dir).map_err(|e| format!("Can't create {}: {e}", dir.display()))?;
             let exe = dir.join("hilal.exe");
-            std::fs::write(&exe, PAYLOAD).map_err(|e| format!("Can't write {}: {e}", exe.display()))?;
+            write_retrying(&exe, PAYLOAD).map_err(|e| format!("Can't write {}: {e}", exe.display()))?;
             // A copy of this installer stays behind as the uninstaller.
             let me = std::env::current_exe().map_err(|e| e.to_string())?;
             let uninstaller = dir.join("uninstall.exe");
@@ -150,7 +150,36 @@ pub fn launch() {
     let _ = Command::new(install_dir().join("hilal.exe")).current_dir(install_dir()).spawn();
 }
 
+/// Asks a running Hilal to close (so it removes its own tray icon), and only forces it
+/// if it hasn't gone within two seconds.
+/// Windows can keep an exe locked for a moment after its process ends, so keep trying
+/// for a few seconds before giving up.
+fn write_retrying(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::write(path, data) {
+            Err(e) if start.elapsed().as_secs() < 5 => {
+                let _ = e;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn stop_running() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+    let start = std::time::Instant::now();
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(w!("HilalNotch"), None) {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            while FindWindowW(w!("HilalNotch"), None).is_ok_and(|h| !h.is_invalid()) && start.elapsed().as_secs_f32() < 2.0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
     let _ = Command::new("taskkill").args(["/im", "hilal.exe", "/f"]).creation_flags(NO_WINDOW).output();
     std::thread::sleep(std::time::Duration::from_millis(300));
 }

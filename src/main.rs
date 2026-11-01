@@ -3,7 +3,10 @@
 mod gfx;
 mod lyrics;
 mod media;
+mod download;
+mod prayer;
 mod shell;
+mod sound;
 mod store;
 mod sysmon;
 mod ui;
@@ -11,7 +14,7 @@ mod win;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -28,26 +31,64 @@ use ui::{App, OV_W, WIN_H, WIN_W};
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted by the mouse hook when the cursor nears the notch; it only wakes the loop.
 const WM_WAKE: u32 = WM_APP + 2;
+/// Posted by the keyboard hook when a screenshot key was pressed and held back.
+const WM_SHOT: u32 = WM_APP + 3;
 const MENU_START: usize = 1;
 const MENU_MINIMAL: usize = 2;
 const MENU_EXIT: usize = 3;
 const MENU_GLASS: usize = 4;
 const MENU_OVERLAY: usize = 5;
 const MENU_FULLSCREEN: usize = 6;
+const MENU_ADHAN: usize = 7;
+const MENU_BELLS: usize = 8;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Bottom edge of the area (physical px) where cursor moves should wake the loop.
 static WAKE_ZONE: AtomicI32 = AtomicI32::new(0);
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+/// The screenshot key currently held back, so its key-up is held back too.
+static HELD_KEY: AtomicU32 = AtomicU32::new(0);
 
 /// A low-level mouse hook on its own thread, so the notch reacts the instant the cursor
 /// reaches the top of the screen, and the system's mouse never waits on our rendering.
 fn start_mouse_hook() {
     std::thread::spawn(|| unsafe {
         let Ok(_hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) else { return };
+        let _keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), None, 0);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
     });
+}
+
+/// Screenshot keys (PrintScreen in any combination, Win+Shift+S): while our windows are
+/// hidden from capture, Windows would paint them black in the picture. Hold the key back
+/// and let the app make itself capturable first; it sends the key on a moment later.
+unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SNAPSHOT};
+    if code >= 0 {
+        let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        if k.dwExtraInfo != win::INJECTED {
+            let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            if !down && HELD_KEY.load(Ordering::Relaxed) == k.vkCode {
+                HELD_KEY.store(0, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+            if down && win::CAPTURE_HIDDEN.load(Ordering::Relaxed) {
+                let held = |v: VIRTUAL_KEY| GetAsyncKeyState(v.0 as i32) < 0;
+                let (shift, ctrl, alt, winkey) = (held(VK_SHIFT), held(VK_CONTROL), held(VK_MENU), held(VK_LWIN) || held(VK_RWIN));
+                let shot = k.vkCode == VK_SNAPSHOT.0 as u32 || (k.vkCode == 'S' as u32 && winkey && shift);
+                if shot {
+                    let mods = (shift as u8 * win::MOD_SHIFT) | (ctrl as u8 * win::MOD_CTRL) | (alt as u8 * win::MOD_ALT) | (winkey as u8 * win::MOD_WIN);
+                    HELD_KEY.store(k.vkCode, Ordering::Relaxed);
+                    let hwnd = HWND(NOTCH_HWND.load(Ordering::Relaxed) as _);
+                    let _ = PostMessageW(hwnd, WM_SHOT, WPARAM(k.vkCode as usize), LPARAM(mods as isize));
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -74,6 +115,12 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 fn main() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // One Hilal at a time: a second launch just leaves.
+        let _instance = windows::Win32::System::Threading::CreateMutexW(None, true, w!(r"Local\Hilal.SingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return Ok(());
+        }
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         OleInitialize(None)?;
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSEXW {
@@ -178,14 +225,23 @@ fn place(hwnd: HWND, w: i32, h: i32) -> POINT {
     pos
 }
 
+/// Hilal's tray icon identity. With a fixed GUID, a new run takes over the icon slot of a
+/// run that was killed before it could remove its icon, instead of adding a second one.
+const TRAY_GUID: windows::core::GUID = windows::core::GUID::from_u128(0x6c1f1a52_8d3e_4b8e_9a51_2f4f1c7d9e31);
+/// Windows binds a tray GUID to one exe path; a copy elsewhere (a dev build) falls back
+/// to the classic hwnd + id identity.
+static TRAY_USES_GUID: AtomicBool = AtomicBool::new(true);
+
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    let guid = TRAY_USES_GUID.load(Ordering::Relaxed);
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP | if guid { NIF_GUID } else { NOTIFY_ICON_DATA_FLAGS(0) },
         uCallbackMessage: WM_TRAY,
         hIcon: app_icon(true),
+        guidItem: if guid { TRAY_GUID } else { windows::core::GUID::zeroed() },
         ..Default::default()
     };
     for (dst, src) in data.szTip.iter_mut().zip("Hilal".encode_utf16()) {
@@ -208,9 +264,18 @@ fn app_icon(small: bool) -> HICON {
 
 fn add_tray(hwnd: HWND) {
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd));
+        TRAY_USES_GUID.store(true, Ordering::Relaxed);
+        // Clear a stale icon left by a run that didn't get to remove its own.
+        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+        if !Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)).as_bool() {
+            TRAY_USES_GUID.store(false, Ordering::Relaxed);
+            let _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd));
+        }
     }
 }
+
+/// Sent to every top-level window when Explorer (and so the tray) starts again.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn tray_menu(hwnd: HWND) {
     let minimal = with_app(|a| a.minimal()).unwrap_or(false);
@@ -226,6 +291,12 @@ fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(minimal), MENU_MINIMAL, w!("Minimal notch"));
         let _ = AppendMenuW(menu, check(overlay), MENU_OVERLAY, w!("FPS overlay"));
         let _ = AppendMenuW(menu, check(fullscreen), MENU_FULLSCREEN, w!("Hide in full screen"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let adhan = sound::adhan().is_some();
+        let _ = AppendMenuW(menu, check(adhan), MENU_ADHAN, w!("Adhan sound\u{2026}"));
+        if adhan {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_BELLS, w!("Use the bells instead"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
         let mut p = POINT::default();
@@ -247,12 +318,46 @@ fn tray_menu(hwnd: HWND) {
             MENU_FULLSCREEN => {
                 with_app(|a| a.set_hide_in_fullscreen(!fullscreen));
             }
+            MENU_ADHAN => {
+                // The chosen recording is copied in, then played once to hear it.
+                if let Some(path) = pick_audio(hwnd) {
+                    if sound::set_adhan(Some(&path)).is_ok() {
+                        sound::play_prayer();
+                    }
+                }
+            }
+            MENU_BELLS => {
+                sound::stop();
+                let _ = sound::set_adhan(None);
+            }
             MENU_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }
             _ => {}
         }
     }
+}
+
+/// Asks for an audio file with the standard Open dialog.
+fn pick_audio(hwnd: HWND) -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW};
+    let mut buf = vec![0u16; 2048];
+    let filter: Vec<u16> = format!("Audio\0{}\0\0", sound::ADHAN_TYPES.map(|e| format!("*.{e}")).join(";")).encode_utf16().collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: windows::core::PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("Choose the adhan sound"),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]).into())
 }
 
 fn dp(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
@@ -263,8 +368,24 @@ fn dp(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) {
+        add_tray(hwnd);
+        return LRESULT(0);
+    }
     let handled = match msg {
         WM_WAKE => Some(()),
+        WM_SETTINGCHANGE => {
+            win::refresh_time_format();
+            None
+        }
+        WM_SHOT => {
+            let (vk, mods) = (wparam.0 as u16, lparam.0 as u8);
+            // If the app is busy (a modal loop), don't lose the key: send it on as is.
+            if with_app(|a| a.begin_screenshot(vk, mods)).is_none() {
+                win::replay_keys(vk, mods);
+            }
+            Some(())
+        }
         WM_WTSSESSION_CHANGE if wparam.0 as u32 == WTS_SESSION_UNLOCK => with_app(|a| a.welcome(true)),
         WM_LBUTTONDOWN => {
             let (x, y) = dp(hwnd, lparam);
@@ -311,6 +432,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
         }),
         WM_DESTROY => {
+            // Tear down while the window still exists: the tray icon, then the app with its
+            // GPU and composition objects. Releasing those after the window (or the whole
+            // program) is gone makes Windows report a crash on exit.
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+            }
+            let app = APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut a| a.take()));
+            drop(app);
             unsafe { PostQuitMessage(0) };
             Some(())
         }

@@ -90,6 +90,9 @@ struct Surface {
     pos: (i32, i32),
     /// The desktop behind this window (texture, its D2D view) and where it's copied from.
     behind: Option<(ID3D11Texture2D, ID2D1Bitmap1, D3D11_BOX)>,
+    /// The backdrop needs a whole copy, not just the parts of the screen that changed:
+    /// it's new (blank), or its source box moved.
+    fresh: bool,
     /// Present waits for vblank. Only the notch paces the frame loop this way.
     vsync: bool,
 }
@@ -124,6 +127,9 @@ pub struct Gfx {
     /// Desktop frames whose captured content changed (the on-screen FPS counts these),
     /// and the bounding box of what changed since the owner last cleared it.
     pub screen_frames: u64,
+    /// When every backdrop was last copied whole (a periodic refresh, so a still area of
+    /// the screen can never leave the glass stuck on an old or blank image).
+    last_full: std::time::Instant,
     pub screen_dirty: Option<(i32, i32, i32, i32)>,
     pub presents: u64,
     font: String,
@@ -182,6 +188,7 @@ impl Gfx {
                 base: Cell::new((0.0, 1.0, 0.0)),
                 dump_to: None,
                 screen_frames: 0,
+                last_full: std::time::Instant::now(),
                 screen_dirty: None,
                 presents: 0,
                 font: font.into(),
@@ -221,7 +228,7 @@ impl Gfx {
             visual.SetContent(&swapchain)?;
             target.SetRoot(&visual)?;
             dcomp.Commit()?;
-            self.surfaces.push(Surface { swapchain, _dcomp: (dcomp, target, visual), target: None, px_w, px_h, pos, behind: None, vsync });
+            self.surfaces.push(Surface { swapchain, _dcomp: (dcomp, target, visual), target: None, px_w, px_h, pos, behind: None, fresh: true, vsync });
         }
         let id = self.surfaces.len() - 1;
         self.bind(id)?;
@@ -367,6 +374,7 @@ impl Gfx {
     /// Gives a surface its own texture of the desktop region behind it.
     fn make_behind(&mut self, id: usize) -> Result<()> {
         let Some((_, (ox, oy))) = self.dup else { return Ok(()) };
+        self.surfaces[id].fresh = true;
         let s = &self.surfaces[id];
         let src = D3D11_BOX {
             left: (s.pos.0 - ox).max(0) as u32,
@@ -437,6 +445,24 @@ impl Gfx {
                 }
             }
             let mut changed = 0u32;
+            if self.last_full.elapsed() > std::time::Duration::from_secs(2) {
+                self.last_full = std::time::Instant::now();
+                for s in &mut self.surfaces {
+                    s.fresh = true;
+                }
+            }
+            // A new or moved backdrop takes the whole image behind it from this frame.
+            if info.LastPresentTime != 0 {
+                if let Some(frame) = res.as_ref().and_then(|r| r.cast::<ID3D11Texture2D>().ok()) {
+                    for (id, s) in self.surfaces.iter_mut().enumerate() {
+                        if let (true, Some((tex, _, b))) = (s.fresh, &s.behind) {
+                            self.ctx.CopySubresourceRegion(tex, 0, 0, 0, 0, &frame, 0, Some(b));
+                            s.fresh = false;
+                            changed |= 1 << id;
+                        }
+                    }
+                }
+            }
             if info.LastPresentTime != 0 && info.TotalMetadataBufferSize > 0 {
                 let mut rects = [RECT::default(); 64];
                 let mut needed = 0u32;

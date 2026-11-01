@@ -1,0 +1,31 @@
+1 ICON "../assets/hilal.ico"
+
+// RT_MANIFEST: run as the current user. Without it, Windows sees "Setup" in the name and
+// asks for admin rights, which this per-user installer doesn't need.
+1 24 "setup.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,3,0,0
+PRODUCTVERSION 0,3,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Hilal"
+            VALUE "FileDescription", "Hilal Setup"
+            VALUE "FileVersion", "0.3.0"
+            VALUE "InternalName", "HilalSetup"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Mohamed Emad"
+            VALUE "OriginalFilename", "HilalSetup.exe"
+            VALUE "ProductName", "Hilal"
+            VALUE "ProductVersion", "0.3.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

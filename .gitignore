@@ -1,0 +1,10 @@
+/target
+/dist
+
+# Research output: screenshots, frame dumps, logs, and a copy of Nusa's site (not ours).
+/research/site
+/research/dump-*
+/research/dbg
+/research/*.png
+/research/*.csv
+/research/fps.txt

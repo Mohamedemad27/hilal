@@ -1,0 +1,27 @@
+1 ICON "assets/hilal.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,3,0,0
+PRODUCTVERSION 0,3,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Hilal"
+            VALUE "FileDescription", "Hilal"
+            VALUE "FileVersion", "0.3.0"
+            VALUE "InternalName", "hilal"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Mohamed Emad"
+            VALUE "OriginalFilename", "hilal.exe"
+            VALUE "ProductName", "Hilal"
+            VALUE "ProductVersion", "0.3.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

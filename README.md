@@ -54,14 +54,31 @@ behavior over maximized windows and in full screen, and the adhan sound.
 
 ## Install
 
-Download the installer from the [releases](../../releases) if there is one, or build it yourself
-(below) and run `dist\HilalSetup-<version>.exe`. It installs for your user only (no admin rights) to
-`%LOCALAPPDATA%\Programs\Hilal`.
+1. Download **[HilalSetup-0.3.0.exe](https://github.com/Mohamedemad27/hilal/releases/latest/download/HilalSetup-0.3.0.exe)**
+   (or see [all releases](https://github.com/Mohamedemad27/hilal/releases)).
+2. Run it and press **Install**, then **Launch Hilal**. It installs for your user only, with no
+   admin rights, to `%LOCALAPPDATA%\Programs\Hilal`, and adds Hilal to the Start menu.
 
-The **Video Download** page needs two free tools in a `tools` folder next to `hilal.exe`:
-[`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases) and
-[`ffmpeg.exe` with `ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/). Node.js on the PATH helps
-yt-dlp with YouTube.
+Windows SmartScreen may warn that the installer is from an unknown publisher (it isn't code-signed):
+choose **More info**, then **Run anyway**. To build it yourself instead, see [Build](#build).
+
+### For the Video Download page
+
+It needs two free tools that aren't bundled. Put them in a `tools` folder inside Hilal's folder, so
+you end up with:
+
+```
+%LOCALAPPDATA%\Programs\Hilal\tools\yt-dlp.exe
+%LOCALAPPDATA%\Programs\Hilal\tools\ffmpeg.exe
+%LOCALAPPDATA%\Programs\Hilal\tools\ffprobe.exe
+```
+
+- **yt-dlp:** download [yt-dlp.exe](https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe)
+  and put it there as is.
+- **FFmpeg:** download [ffmpeg-release-essentials.zip](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip),
+  open it, and copy `ffmpeg.exe` and `ffprobe.exe` from its `bin` folder.
+- **[Node.js](https://nodejs.org/)** (optional): if it's installed, yt-dlp uses it to handle
+  YouTube's checks, which keeps YouTube downloads working.
 
 ## Build
 
@@ -73,10 +90,16 @@ Requirements: Windows 10 (2004 or later) or Windows 11, and the Rust **GNU** too
 `rust-toolchain.toml`; no Visual Studio needed). Build from PowerShell.
 
 ```powershell
+git clone https://github.com/Mohamedemad27/hilal.git
+cd hilal
 cargo build --release     # target\release\hilal.exe
 cargo test --release      # the unit tests
-.\dist.ps1                # builds Hilal and the installer: dist\HilalSetup-<version>.exe
+.\dist.ps1                # builds Hilal and its installer: dist\HilalSetup-<version>.exe
 ```
+
+Get Rust from [rustup.rs](https://rustup.rs/). The project uses the toolchain named in
+`rust-toolchain.toml`; if cargo doesn't fetch it on its own, run
+`rustup toolchain install stable-x86_64-pc-windows-gnu`.
 
 The `research` folder has the scripts used to test Hilal for real: driving the mouse, recording the
 speakers, measuring frame timing and GPU use. Set `HILAL_FPS=<file>` to have Hilal log frame timing

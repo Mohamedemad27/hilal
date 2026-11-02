@@ -1,9 +1,12 @@
 # Builds Hilal and packs it into dist\HilalSetup-<version>.exe.
 # Run from PowerShell (not Git Bash): .\dist.ps1
 $ErrorActionPreference = 'Stop'
-$env:RUSTUP_HOME = 'K:\rust\rustup'
-$env:CARGO_HOME = 'K:\rust\cargo'
-$env:PATH = "K:\rust\cargo\bin;$env:PATH"
+# A Rust install kept on K: (the author's machine); elsewhere the usual rustup one is used.
+if (Test-Path 'K:\rust\cargo\bin\cargo.exe') {
+    $env:RUSTUP_HOME = 'K:\rust\rustup'
+    $env:CARGO_HOME = 'K:\rust\cargo'
+    $env:PATH = "K:\rust\cargo\bin;$env:PATH"
+}
 Set-Location $PSScriptRoot
 
 cargo build --release -p hilal

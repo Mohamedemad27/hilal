@@ -27,6 +27,9 @@ use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSU
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::*;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use ui::{App, OV_W, WIN_H, WIN_W};
@@ -114,6 +117,37 @@ thread_local! {
 
 /// Runs `f` on the app unless it's already in use (a modal loop such as a drag or the
 /// tray menu re-entering the window procedure), in which case the message falls through.
+/// The display's refresh rate (60 if Windows reports none).
+fn refresh_rate() -> u32 {
+    match win::refresh_hz() {
+        hz if hz >= 24 => hz,
+        _ => 60,
+    }
+}
+
+/// Sleeps until `due` (to well under a millisecond with the high-resolution timer), or
+/// until input arrives, whichever is first.
+unsafe fn wait_until(timer: Option<HANDLE>, due: std::time::Instant) {
+    let left = due.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return;
+    }
+    match timer {
+        Some(t) => {
+            // Negative: relative, in 100 ns units.
+            let when = -((left.as_nanos() / 100) as i64).max(1);
+            if SetWaitableTimer(t, &when, 0, None, None, false).is_ok() {
+                MsgWaitForMultipleObjects(Some(&[t]), false, INFINITE, QS_ALLINPUT);
+                return;
+            }
+            MsgWaitForMultipleObjects(None, false, left.as_millis().max(1) as u32, QS_ALLINPUT);
+        }
+        None => {
+            MsgWaitForMultipleObjects(None, false, left.as_millis().max(1) as u32, QS_ALLINPUT);
+        }
+    }
+}
+
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut a| a.as_mut().map(f)))
 }
@@ -222,7 +256,18 @@ fn main() -> Result<()> {
 
         // Frame loop: while something moves, every frame is presented with vsync (which
         // also paces the loop); when still, sleep until input or a short poll interval.
+        //
+        // Not every driver makes that vsync wait (some AMD setups return at once), and then
+        // the loop would draw hundreds of frames a second nobody sees, loading the GPU. So
+        // a frame that comes much sooner than one refresh after the last waits for its turn.
         let mut msg = MSG::default();
+        let pacer = CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0).ok();
+        let mut hz = refresh_rate();
+        let mut hz_at = std::time::Instant::now();
+        let mut last_start: Option<std::time::Instant> = None;
+        let mut held = 0u32;
+        // HILAL_NO_PACER=1 turns this off (to compare).
+        let pacing = std::env::var_os("HILAL_NO_PACER").is_none();
         'run: loop {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -236,6 +281,26 @@ fn main() -> Result<()> {
                 }
             }
             WAKE_PENDING.store(false, Ordering::Release);
+            if hz_at.elapsed() > std::time::Duration::from_secs(2) {
+                hz = refresh_rate();
+                hz_at = std::time::Instant::now();
+                if held > 0 {
+                    ui::trace(&format!("[pacer] held back {held} early frames ({hz} Hz)"));
+                    held = 0;
+                }
+            }
+            // Back-to-back frames: more than half a refresh early means the vsync wait
+            // didn't happen; hold this one until a whole refresh has passed.
+            if let Some(prev) = last_start.filter(|_| pacing) {
+                let period = std::time::Duration::from_secs_f64(1.0 / hz as f64);
+                // (A little early: waking up runs a fraction of a millisecond late.)
+                let due = prev + period.saturating_sub(std::time::Duration::from_micros(400));
+                if std::time::Instant::now() < prev + period / 2 {
+                    held += 1;
+                    wait_until(pacer, due);
+                    continue;
+                }
+            }
             // When still, the mouse hook wakes us instantly when needed; otherwise we
             // check the clock, reminders and the glass backdrop a few times a second.
             let t = std::time::Instant::now();
@@ -244,7 +309,10 @@ fn main() -> Result<()> {
                 ui::trace(&format!("[slow frame] {} ms", t.elapsed().as_millis()));
             }
             if wait > 0 {
+                last_start = None;
                 MsgWaitForMultipleObjects(None, false, wait, QS_ALLINPUT);
+            } else {
+                last_start = Some(t);
             }
         }
         let _ = WTSUnRegisterSessionNotification(hwnd);

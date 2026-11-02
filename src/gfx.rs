@@ -699,7 +699,11 @@ impl Gfx {
             let s = &self.surfaces[self.current];
             if s.vsync {
                 self.presents += 1;
-                s.swapchain.Present(1, DXGI_PRESENT(0)).ok()
+                // HILAL_NO_VSYNC=1 presents without waiting, the way some drivers behave,
+                // to test the frame loop's own pacing.
+                static NO_VSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let sync = if *NO_VSYNC.get_or_init(|| std::env::var_os("HILAL_NO_VSYNC").is_some()) { 0 } else { 1 };
+                s.swapchain.Present(sync, DXGI_PRESENT(0)).ok()
             } else {
                 // Side surfaces must never hold up the notch's vsync-paced loop: if their
                 // buffers are still busy, this frame is skipped (the caller retries).

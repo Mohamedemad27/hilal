@@ -5,8 +5,8 @@
 1 24 "setup.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,3,0,0
-PRODUCTVERSION 0,3,0,0
+FILEVERSION 0,3,1,0
+PRODUCTVERSION 0,3,1,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -16,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Hilal"
             VALUE "FileDescription", "Hilal Setup"
-            VALUE "FileVersion", "0.3.0"
+            VALUE "FileVersion", "0.3.1"
             VALUE "InternalName", "HilalSetup"
             VALUE "LegalCopyright", "Copyright (c) 2026 Mohamed Emad"
             VALUE "OriginalFilename", "HilalSetup.exe"
             VALUE "ProductName", "Hilal"
-            VALUE "ProductVersion", "0.3.0"
+            VALUE "ProductVersion", "0.3.1"
         END
     END
     BLOCK "VarFileInfo"

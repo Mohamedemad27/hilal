@@ -54,8 +54,8 @@ behavior over maximized windows and in full screen, and the adhan sound.
 
 ## Install
 
-1. Download **[HilalSetup-0.3.0.exe](https://github.com/Mohamedemad27/hilal/releases/latest/download/HilalSetup-0.3.0.exe)**
-   (or see [all releases](https://github.com/Mohamedemad27/hilal/releases)).
+1. Download the newest **HilalSetup** from [the latest release](https://github.com/Mohamedemad27/hilal/releases/latest)
+   (under **Assets**).
 2. Run it and press **Install**, then **Launch Hilal**. It installs for your user only, with no
    admin rights, to `%LOCALAPPDATA%\Programs\Hilal`, and adds Hilal to the Start menu.
 

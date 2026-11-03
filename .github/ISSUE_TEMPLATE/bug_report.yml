@@ -1,0 +1,71 @@
+name: "🐞 Bug report · بلاغ عن مشكلة"
+description: "Something in Hilal doesn't work, looks wrong, or slows your PC down. · حاجة في هلال مش شغالة أو شكلها غلط أو بتتقّل الجهاز."
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Sorry it's giving you trouble! Write in **English or Arabic**.
+        آسفين إنه تاعبك! اكتب **بالعربي أو بالإنجليزي**.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: "What happened? · إيه اللي حصل؟"
+      description: "And what did you expect instead? A screenshot or a short screen recording helps a lot. · وكنت متوقع يحصل إيه؟ صورة أو فيديو قصير للشاشة بيساعد جداً."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "How can we make it happen? · نعمل إيه عشان تحصل؟"
+      placeholder: |
+        1. Open the notch
+        2. Go to the System page
+        3. ...
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: "Hilal version · نسخة هلال"
+      description: "Right-click hilal.exe → Properties → Details, or the installer's name. · كليك يمين على hilal.exe ← Properties ← Details، أو من اسم ملف التثبيت."
+      placeholder: "0.3.1"
+    validations:
+      required: true
+
+  - type: input
+    id: pc
+    attributes:
+      label: "Windows, graphics card and screen · الويندوز والكارت والشاشة"
+      placeholder: "Windows 11 24H2, AMD RX 6800, 1440p 165 Hz"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: glass
+    attributes:
+      label: "Is Liquid Glass on? · الـ Liquid Glass شغال؟"
+      options:
+        - "Yes · أيوه"
+        - "No · لأ"
+        - "Not sure · مش متأكد"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: "Hilal's log (optional, very helpful for slowness or freezes) · لوج هلال (اختياري، بيساعد جداً في التقل أو التعليق)"
+      description: |
+        Exit Hilal from its tray menu, then run this in PowerShell, use Hilal until the problem shows, exit it again, and drag `hilal-log.txt` from your Desktop here:
+        اقفل هلال من قايمة الأيقونة، وشغّل الأمر ده في PowerShell، واستخدم هلال لحد ما المشكلة تظهر، واقفله تاني، واسحب ملف `hilal-log.txt` من الديسكتوب هنا:
+
+        ```powershell
+        $env:HILAL_FPS = "$env:USERPROFILE\Desktop\hilal-log.txt"; & "$env:LOCALAPPDATA\Programs\Hilal\hilal.exe"
+        ```
+    validations:
+      required: false

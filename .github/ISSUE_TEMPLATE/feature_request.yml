@@ -1,0 +1,56 @@
+name: "💡 Feature request · اقتراح ميزة"
+description: "Suggest something new for Hilal, or a better way to do something it already does. · اقترح حاجة جديدة لهلال أو طريقة أحسن لحاجة موجودة."
+title: "[Idea] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape Hilal! Write in **English or Arabic**, whichever is easier.
+        شكراً إنك بتساعد في تطوير هلال! اكتب **بالعربي أو بالإنجليزي**، اللي يريحك.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: "What would you like? · عايز إيه؟"
+      description: "Describe the feature. What should it do? · اوصف الميزة: المفروض تعمل إيه؟"
+      placeholder: "e.g. A weather page that shows today's temperature in the closed notch."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: "Why would it help? · هتفيد في إيه؟"
+      description: "What do you do today, and what's missing or annoying? · بتعمل إيه دلوقتي، وإيه اللي ناقص أو مضايقك؟"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "Which part of Hilal? · في أنهي جزء من هلال؟"
+      options:
+        - "The closed notch · النوتش وهو مقفول"
+        - "Music & lyrics · الأغاني والكلمات"
+        - "Pomodoro · بومودورو"
+        - "Water reminder · تذكير المية"
+        - "Prayer times · مواقيت الصلاة"
+        - "Video download · تحميل الفيديوهات"
+        - "Claude Code · كلود كود"
+        - "Shelf · الرف"
+        - "Todo · المهام"
+        - "System · النظام"
+        - "Settings & tray menu · الإعدادات وقايمة الأيقونة"
+        - "A new page · صفحة جديدة"
+        - "Something else · حاجة تانية"
+    validations:
+      required: true
+
+  - type: textarea
+    id: look
+    attributes:
+      label: "How should it look or work? (optional) · المفروض تبان أو تشتغل إزاي؟ (اختياري)"
+      description: "Sketches, screenshots or examples from other apps are very welcome — drag images here. · رسمة أو صورة أو مثال من تطبيق تاني هيساعد جداً: اسحب الصور هنا."
+    validations:
+      required: false

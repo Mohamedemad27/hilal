@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: "⬇️ Download Hilal · تنزيل هلال"
+    url: https://github.com/Mohamedemad27/hilal/releases/latest
+    about: "The latest installer. · آخر نسخة من ملف التثبيت."

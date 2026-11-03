@@ -105,6 +105,16 @@ The `research` folder has the scripts used to test Hilal for real: driving the m
 speakers, measuring frame timing and GPU use. Set `HILAL_FPS=<file>` to have Hilal log frame timing
 and events there, and `HILAL_DUMP=<folder>` to save pictures of what it draws.
 
+## Ideas and bugs
+
+Have an idea for Hilal, or found something that doesn't work? Tell us, in English or Arabic:
+
+- 💡 **[Suggest a feature](https://github.com/Mohamedemad27/hilal/issues/new?template=feature_request.yml)**
+- 🐞 **[Report a bug](https://github.com/Mohamedemad27/hilal/issues/new?template=bug_report.yml)**
+
+You'll need a (free) GitHub account. See what others have asked for in
+[Issues](https://github.com/Mohamedemad27/hilal/issues), and add a 👍 to the ideas you'd like too.
+
 ## Privacy
 
 Hilal keeps everything on your PC, in `%APPDATA%\Hilal`. There's no account and no telemetry. It

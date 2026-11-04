@@ -93,6 +93,11 @@ pub fn seconds_of_day() -> u32 {
     t.wHour as u32 * 3600 + t.wMinute as u32 * 60 + t.wSecond as u32
 }
 
+/// Today's day of the week (0 Sunday).
+pub fn weekday() -> u16 {
+    unsafe { GetLocalTime() }.wDayOfWeek
+}
+
 pub fn hour() -> u16 {
     unsafe { GetLocalTime() }.wHour
 }
@@ -130,6 +135,27 @@ pub fn exclude_from_capture(hwnd: windows::Win32::Foundation::HWND, on: bool) {
     CAPTURE_HIDDEN.store(on, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let _ = SetWindowDisplayAffinity(hwnd, if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE });
+    }
+}
+
+/// A screen recorder or streaming app is running (OBS, Streamlabs). Those are only open to
+/// record, unlike Discord or NVIDIA's overlay, which run all the time and are left out.
+pub fn recorder_running() -> bool {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    const RECORDERS: [&str; 5] = ["obs64.exe", "obs32.exe", "obs.exe", "streamlabs obs.exe", "streamlabs desktop.exe"];
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return false };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = false;
+        let mut more = Process32FirstW(snap, &mut e).is_ok();
+        while more && !found {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase();
+            found = RECORDERS.contains(&name.as_str());
+            more = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        found
     }
 }
 

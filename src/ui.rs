@@ -19,14 +19,32 @@ use crate::media::{Command, Media, Track};
 use crate::download::{self, Kind, Phase};
 use crate::claude::{self, Session};
 use crate::prayer;
+use crate::reminders_data::REMINDERS;
+
+mod settings;
+pub use settings::{After as SettingsAfter, SW_H, SW_W};
 use crate::store::{self, Store, Task};
 use crate::sysmon::{Snapshot, Sysmon};
 use crate::{shell, win};
 use std::collections::VecDeque;
 
 pub const WIN_W: f32 = 640.0;
-pub const WIN_H: f32 = 190.0;
+pub const WIN_H: f32 = 280.0;
+/// How far down the screen the mouse wakes the notch, and where the FPS overlay starts
+/// (the window's old height, before it grew room for the reminder card).
+pub const WAKE_H: f32 = 190.0;
+/// The notch's middle in the window, where it starts out (at the top center of the screen).
 const CX: f32 = WIN_W / 2.0;
+
+/// Moving it (Nova Island's numbers): within this many dp of the top edge it docks there,
+/// and docked within this many of the middle it snaps to the middle. Floating, it sits
+/// this far down its window. It keeps this far from the screen's sides.
+const SNAP_DP: f32 = 28.0;
+const CENTER_SNAP_DP: f32 = 40.0;
+const FLOAT_TOP: f32 = 8.0;
+const PILL_HALF_W: f32 = 120.0;
+/// Half the height of the closed notch standing on a side edge.
+const V_HALF: f32 = 122.0;
 
 const SKY: Color = rgb(0x3f, 0xb4, 0xff);
 const BLUE: Color = rgb(0x26, 0x99, 0xff);
@@ -42,8 +60,16 @@ const CLAUDE: Color = rgb(0xd9, 0x77, 0x57);
 /// Pill buttons: label size, and the room on each side of their content.
 const PILL_TEXT: f32 = 11.5;
 const PILL_PAD: f32 = 11.0;
+/// How long a dhikr, du'a or verse stays.
+/// The reminder card: as wide as Nova Island's, and at most this tall.
+const REMINDER_W: f32 = 500.0;
+const REMINDER_W_SIDE: f32 = 340.0;
+const REMINDER_MAX_H: f32 = 270.0;
 /// How long a prayer time stays in the notch if nobody dismisses it.
 const PRAYER_SHOWN: Duration = Duration::from_secs(180);
+/// The heads-up before a prayer: how many minutes before, and how long it stays.
+const PRAYER_HEADSUP: i32 = 10;
+const HEADSUP_SHOWN: Duration = Duration::from_secs(5);
 /// How long the mouse rests on the thin line (over a maximized window) before it opens.
 const HOVER_REST: Duration = Duration::from_millis(250);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
@@ -67,6 +93,10 @@ const MINIMAL: Shape = Shape { w: 120.0, h: 6.0, r: 3.0, e: 4.0 };
 const PAGE: Shape = Shape { w: 420.0, h: 140.0, r: 32.0, e: 22.0 };
 const WIDE: Shape = Shape { w: 520.0, h: 140.0, r: 32.0, e: 22.0 };
 const PEEK: Shape = Shape { w: 310.0, h: 60.0, r: 19.0, e: 13.0 };
+/// Closed, standing on a side edge: tall, or shorter with music or a timer on.
+const V_IDLE: Shape = Shape { w: 44.0, h: 244.0, r: 22.0, e: 0.0 };
+const V_COMPACT: Shape = Shape { w: 44.0, h: 136.0, r: 22.0, e: 0.0 };
+const V_MINIMAL: Shape = Shape { w: 6.0, h: 120.0, r: 3.0, e: 0.0 };
 
 /// How long the welcome peek stays before closing.
 const WELCOME: Duration = Duration::from_millis(3400);
@@ -189,6 +219,7 @@ enum Action {
     WaterSub(usize),
     Bottle(i32),
     WaterSnooze,
+    ReminderDismiss,
     /// Step through the prayer cities by this much.
     PrayerCity(i32),
     PrayerAlerts,
@@ -398,7 +429,29 @@ pub struct App {
     water_chimes: u32,
     /// A prayer time that just came (index into `prayer::NAMES`, its time in minutes),
     /// shown as a peek until dismissed or for a few minutes.
-    prayer_ask: Option<(usize, i32)>,
+    prayer_ask: Option<(usize, i32, bool)>,
+    /// A dhikr, du'a or verse showing (an index into `REMINDERS`), since when, until when
+    /// (hovering it holds that back), how long it was given, and its card and font size.
+    reminder: Option<usize>,
+    reminder_at: Instant,
+    reminder_until: Instant,
+    reminder_total: Duration,
+    reminder_card: (Shape, f32),
+    /// When the next one is due (counted from when the last one left), and the interval it
+    /// was counted with (a new interval counts from now).
+    reminder_next: Option<(Instant, u32)>,
+    /// Shown with "Show one now": stays even with the reminders off.
+    reminder_preview: bool,
+    /// The last frame's time, for holding the countdown while the card is hovered.
+    reminder_tick: Instant,
+    /// The card's shell is still shrinking back (the pages mustn't fade in on the way).
+    from_card: Cell<bool>,
+    /// A card just left from under the mouse: no opening until the mouse has moved off.
+    hover_blocked: bool,
+    /// "Auto" looking up where the PC is (the answer, once it comes).
+    locating: Option<std::sync::mpsc::Receiver<Option<crate::store::AutoPlace>>>,
+    /// When it last tried (a failed lookup waits a minute before the next).
+    locate_at: Instant,
     prayer_ask_at: Instant,
     /// The download page: the link, what to save it as, and the download under way.
     dl_url: Option<String>,
@@ -410,11 +463,18 @@ pub struct App {
     /// aside for a full-screen app.
     top_check: Instant,
     hidden_for_fullscreen: bool,
+    /// The glass as it is right now (see `apply_glass`), the sharing option, and whether a
+    /// screen recorder is running.
+    glass_live: bool,
+    share_visible: bool,
+    recorder: bool,
     /// A maximized window is in front (on our screen), so the closed notch keeps out of
     /// its way: a thin line that opens only when the mouse rests on it.
     over_maximized: bool,
     /// Since when the mouse has been on the closed notch (for that resting).
     hover_since: Option<Instant>,
+    /// Pinned open with Ctrl+Alt+H.
+    pinned: bool,
     stats: Stats,
     frame_start: Instant,
     backdrop_retry: Instant,
@@ -423,6 +483,18 @@ pub struct App {
 
     regions: RefCell<Vec<(Rect, Action)>>,
     ox: Cell<f32>,
+    /// How far down the window the notch's top is, as last drawn (hit areas follow it).
+    oy: Cell<f32>,
+    /// Where the anchor is: in screen px, and in the window (dp).
+    anchor_px: (i32, i32),
+    nx: f32,
+    ny: f32,
+    /// The Settings window.
+    settings: settings::SettingsWin,
+    /// A press away from any button (where, in screen px): moved far enough, it drags.
+    press_drag: Option<(i32, i32)>,
+    /// Being dragged: where the anchor is held from the cursor (px).
+    drag: Option<(i32, i32)>,
     lyric_pos: Cell<f32>,
     last_draw: Cell<Instant>,
     overlay: Overlay,
@@ -561,6 +633,9 @@ impl App {
             let rgn = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, (PP_W * k) as i32 + 1, (PP_H * k) as i32 + 1, d, d);
             SetWindowRgn(popup_hwnd, rgn, false);
         }
+        let glass_at_start = store.settings.glass;
+        // HILAL_REMINDER_TEST=<index> shows that reminder right away.
+        let reminder_test = std::env::var_os("HILAL_REMINDER_TEST").map(|_| (now, store.reminders.minutes));
         win::exclude_from_capture(hwnd, store.settings.glass);
         win::exclude_from_capture(overlay_hwnd, store.settings.glass);
         win::exclude_from_capture(popup_hwnd, store.settings.glass);
@@ -624,6 +699,18 @@ impl App {
             water_ask_at: now,
             water_chimes: 0,
             prayer_ask: None,
+            reminder: None,
+            reminder_at: now,
+            reminder_until: now,
+            reminder_total: Duration::from_secs(30),
+            reminder_card: (PEEK, 26.0),
+            reminder_next: reminder_test,
+            reminder_preview: false,
+            reminder_tick: now,
+            from_card: Cell::new(false),
+            hover_blocked: false,
+            locating: None,
+            locate_at: now - Duration::from_secs(3600),
             prayer_ask_at: now,
             dl_url: None,
             dl_kind: Kind::Mp4,
@@ -632,8 +719,12 @@ impl App {
             capture_until: None,
             replay: None,
             hidden_for_fullscreen: false,
+            glass_live: glass_at_start,
+            share_visible: false,
+            recorder: false,
             over_maximized: false,
             hover_since: None,
+            pinned: false,
             stats: Stats::new(now),
             frame_start: now,
             backdrop_retry: now - Duration::from_secs(10),
@@ -641,6 +732,13 @@ impl App {
             t0: now,
             regions: RefCell::new(Vec::new()),
             ox: Cell::new(0.0),
+            oy: Cell::new(0.0),
+            anchor_px: (0, 0),
+            nx: CX,
+            ny: 0.0,
+            settings: settings::SettingsWin::new(),
+            press_drag: None,
+            drag: None,
             lyric_pos: Cell::new(0.0),
             last_draw: Cell::new(now),
         }
@@ -655,6 +753,208 @@ impl App {
     /// The "Minimal notch" choice itself (for the tray menu).
     pub fn minimal_setting(&self) -> bool {
         self.store.settings.minimal
+    }
+
+    /// Ctrl+Alt+H pins the notch open, until it's pressed again (then it closes, even
+    /// with the mouse on it).
+    pub fn hotkey(&mut self) {
+        self.pinned = !self.pinned;
+        self.open = self.pinned;
+        self.left_at = None;
+        if !self.pinned {
+            self.hover_blocked = self.inside;
+        }
+        trace(&format!("[hotkey] pinned {}", self.pinned));
+    }
+
+    /// Standing on a side edge (the nearest one), or back to lying along the top.
+    pub fn vertical(&self) -> bool {
+        self.store.settings.vertical
+    }
+
+    pub fn set_vertical(&mut self, on: bool) {
+        if on == self.store.settings.vertical {
+            return;
+        }
+        let k = self.gfx.scale;
+        let (ax, ay) = self.anchor_px;
+        let (b, _) = monitor_at((ax, ay));
+        let set = &mut self.store.settings;
+        if on {
+            set.side_left = ax < (b.left + b.right) / 2;
+            set.anchor = Some((ax, ay + (V_HALF * k) as i32));
+        } else {
+            set.docked = false;
+            let x = if set.side_left { b.left + (260.0 * k) as i32 } else { b.right - (260.0 * k) as i32 };
+            set.anchor = Some((x, ay - (V_HALF * k) as i32));
+        }
+        set.vertical = on;
+        self.apply_position();
+        self.store.settings.anchor = Some(self.anchor_px);
+        self.store.save();
+    }
+
+    /// Back to its own place: hanging from the top of the main screen, in the middle.
+    pub fn reset_position(&mut self) {
+        let set = &mut self.store.settings;
+        set.anchor = None;
+        set.docked = true;
+        set.vertical = false;
+        self.apply_position();
+        self.store.save();
+    }
+
+    /// Where a shape of the notch sits in the window: docked, at the top with its middle
+    /// on the anchor; floating, a little below the anchor; on a side, flush against that
+    /// edge and centered on the anchor. Always inside the window (so near a screen edge
+    /// it opens toward the free space).
+    fn shape_rect(&self, s: Shape) -> Rect {
+        let set = &self.store.settings;
+        if set.vertical {
+            let x = if set.side_left { 0.0 } else { WIN_W - s.w };
+            let y = (self.ny - s.h / 2.0).clamp(4.0, (WIN_H - s.h - 4.0).max(4.0));
+            return Rect::new(x, y, s.w, s.h);
+        }
+        let e = if set.docked { s.e } else { 0.0 };
+        let half = (s.w / 2.0 + e + 4.0).min(WIN_W / 2.0);
+        let cx = self.nx.clamp(half, WIN_W - half);
+        let y = if set.docked { 0.0 } else { self.ny.clamp(0.0, (WIN_H - s.h - 6.0).max(0.0)) };
+        Rect::new(cx - s.w / 2.0, y, s.w, s.h)
+    }
+
+    /// The corners of a free-standing shape (top-left, top-right, bottom-right,
+    /// bottom-left): square where it touches a screen edge. None for the docked notch,
+    /// which has its ears instead.
+    fn shape_radii(&self, s: Shape) -> Option<[f32; 4]> {
+        let set = &self.store.settings;
+        let r = s.r.min(s.h / 2.0).min(s.w / 2.0).max(0.0);
+        if set.vertical {
+            Some(if set.side_left { [0.0, r, r, 0.0] } else { [r, 0.0, 0.0, r] })
+        } else if set.docked {
+            None
+        } else {
+            Some([r; 4])
+        }
+    }
+
+    /// Dragging the notch (Nova Island's way): a press anywhere but on a button, moved a
+    /// few pixels, carries it. Let go within 28 dp of the top it docks there (snapping to
+    /// the middle when near it), anywhere else it floats. Standing on a side it slides
+    /// along that edge, and crossing the middle of the screen takes it to the other side.
+    fn follow_drag(&mut self) {
+        let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+        let Some(p) = win::cursor_px() else { return };
+        let k = self.gfx.scale;
+        let px = |dp: f32| (dp * k).round() as i32;
+        if self.drag.is_none() {
+            let Some(at) = self.press_drag else { return };
+            if !down {
+                self.press_drag = None;
+                return;
+            }
+            if (((p.0 - at.0).pow(2) + (p.1 - at.1).pow(2)) as f32).sqrt() < 5.0 * k {
+                return;
+            }
+            self.press_drag = None;
+            self.pressed = None;
+            let (ax, ay) = self.anchor_px;
+            // Held near where it was grabbed, so the (shrinking) notch stays under the cursor.
+            let ox = (p.0 - ax).clamp(-px(PILL_HALF_W - 16.0), px(PILL_HALF_W - 16.0));
+            let oy = if self.store.settings.vertical {
+                (p.1 - ay).clamp(-px(V_HALF - 20.0), px(V_HALF - 20.0))
+            } else {
+                (p.1 - ay).clamp(px(4.0), px(34.0 - 6.0))
+            };
+            self.drag = Some((ox, oy));
+            self.open = false;
+            self.left_at = None;
+            self.pinned = false;
+            trace("[drag] start");
+        }
+        let Some((ox, oy)) = self.drag else { return };
+        let (b, _) = monitor_at(p);
+        let set = &mut self.store.settings;
+        if set.vertical {
+            set.side_left = p.0 < (b.left + b.right) / 2;
+            set.anchor = Some((p.0, p.1 - oy));
+        } else {
+            let mut next = (p.0 - ox, p.1 - oy);
+            let docked = next.1 - b.top < px(SNAP_DP);
+            if docked {
+                next.1 = b.top;
+                let middle = (b.left + b.right) / 2;
+                if (next.0 - middle).abs() < px(CENTER_SNAP_DP) {
+                    next.0 = middle;
+                }
+            }
+            set.docked = docked;
+            set.anchor = Some(next);
+        }
+        self.apply_position();
+        self.store.settings.anchor = Some(self.anchor_px);
+        if !down {
+            self.drag = None;
+            self.store.save();
+            // It doesn't spring open under the cursor right after the move.
+            self.hover_blocked = true;
+            let set = &self.store.settings;
+            trace(&format!("[drag] dropped at {:?} docked {} vertical {} left {}", self.anchor_px, set.docked, set.vertical, set.side_left));
+        }
+    }
+
+    /// Puts the window where the notch's anchor is (Nova Island's way): hanging from the
+    /// top edge, floating anywhere, or standing on the left or right edge. The window stays
+    /// on its screen, and the notch sits inside it at the anchor.
+    pub fn apply_position(&mut self) {
+        let k = self.gfx.scale;
+        let px = |dp: f32| (dp * k).round() as i32;
+        let (ww, wh) = (px(WIN_W), px(WIN_H));
+        let set = &self.store.settings;
+        let (b, wa) = monitor_at(set.anchor.unwrap_or((0, 0)));
+        let (mut ax, mut ay) = set.anchor.unwrap_or(((b.left + b.right) / 2, b.top));
+        let (wx, wy);
+        if set.vertical {
+            ax = if set.side_left { b.left } else { b.right };
+            ay = ay.clamp(wa.top + px(V_HALF), (wa.bottom - px(V_HALF)).max(wa.top + px(V_HALF)));
+            wx = if set.side_left { b.left } else { b.right - ww };
+            wy = (ay - wh / 2).clamp(wa.top, (wa.bottom - wh).max(wa.top));
+        } else {
+            ax = ax.clamp(b.left + px(PILL_HALF_W), b.right - px(PILL_HALF_W));
+            ay = if set.docked { b.top } else { ay.clamp(b.top, wa.bottom - px(34.0 + 6.0)) };
+            wx = (ax - ww / 2).clamp(b.left, b.right - ww);
+            wy = if set.docked { b.top } else { (ay - px(FLOAT_TOP)).clamp(b.top, (wa.bottom - wh).max(b.top)) };
+        }
+        self.anchor_px = (ax, ay);
+        self.nx = (ax - wx) as f32 / k;
+        self.ny = (ay - wy) as f32 / k;
+        // Waking up when the mouse comes near: the top strip of the window (the whole
+        // window when it stands on a side).
+        let reach = if set.vertical { wh } else { px(WAKE_H) };
+        crate::set_wake_zone([wx - px(40.0), wy - px(40.0), wx + ww + px(40.0), wy + reach + px(40.0)]);
+        if (wx, wy) != (self.origin.x, self.origin.y) {
+            self.origin = POINT { x: wx, y: wy };
+            unsafe {
+                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, wx, wy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            self.gfx.move_surface(gfx::MAIN, (wx, wy));
+        }
+        // The Claude popup: under the open notch, or beside it on a side, kept on screen.
+        let page = self.shape_rect(PAGE);
+        let (x, y) = if set.vertical {
+            let x = if set.side_left { page.x + page.w + 10.0 } else { page.x - 10.0 - PP_W };
+            (wx + px(x), wy + px(page.y))
+        } else {
+            (wx + px(page.x + page.w / 2.0 - PP_W / 2.0), wy + px(page.y + page.h + 10.0))
+        };
+        let pos = (x.clamp(wa.left, (wa.right - px(PP_W)).max(wa.left)), y.clamp(wa.top, (wa.bottom - px(PP_H)).max(wa.top)));
+        if pos != self.popup.pos {
+            self.popup.pos = pos;
+            unsafe {
+                let _ = SetWindowPos(self.popup.hwnd, HWND_TOPMOST, pos.0, pos.1, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            self.gfx.move_surface(self.popup.surface, pos);
+        }
+        self.closed_sig.clear();
     }
 
     /// What the notch does while a maximized window is in front: 0 stays as it is,
@@ -713,6 +1013,13 @@ impl App {
     /// a video) is in front. The FPS overlay stays, since that's where it's wanted.
     pub fn keep_on_top(&mut self) {
         self.top_check = Instant::now();
+        // A recorder opening or closing turns the glass off or back on.
+        let rec = win::recorder_running();
+        if rec != self.recorder {
+            self.recorder = rec;
+            trace(&format!("[glass] screen recorder {}", if rec { "running: solid notch" } else { "gone: glass back" }));
+            self.apply_glass();
+        }
         let ours = [self.hwnd, self.overlay.hwnd, self.popup.hwnd];
         let maximized = (self.store.settings.shrink_over_maximized || self.store.settings.hide_over_maximized)
             && foreground_is_maximized(self.hwnd, &ours);
@@ -765,19 +1072,66 @@ impl App {
             }
         }
         // A prayer time shows the same way (after any water reminder), once per prayer.
+        self.keep_located();
         if self.prayer_ask.is_none() && self.water_ask.is_none() && !self.welcoming() && self.store.prayer.alerts {
-            if let Some((day, i, at)) = prayer::started(self.store.prayer.city) {
+            let place = self.prayer_place();
+            let calc = self.prayer_calc();
+            if let Some((day, i, at)) = prayer::started(&place, calc) {
                 if self.store.prayer.alerted != (day, i) {
                     self.store.prayer.alerted = (day, i);
                     self.store.save();
-                    self.prayer_ask = Some((i, at));
+                    self.prayer_ask = Some((i, at, false));
                     self.prayer_ask_at = now;
                     crate::sound::play_prayer();
                 }
+            } else if let Some((day, i, at)) = prayer::coming(&place, PRAYER_HEADSUP, calc) {
+                // A silent heads-up a few minutes before, for a few seconds.
+                if self.store.prayer.headsup != (day, i) {
+                    self.store.prayer.headsup = (day, i);
+                    self.store.save();
+                    self.prayer_ask = Some((i, at, true));
+                    self.prayer_ask_at = now;
+                }
+            }
+        }
+        // A dhikr, du'a or verse every few minutes, for some seconds (Nova Island's flow).
+        // Hovering the card holds its countdown; the next is counted from when it leaves,
+        // and waits for a calm moment: no focus session, quiet hours, hidden or open notch,
+        // other peek, or welcome.
+        let dt = now - self.reminder_tick;
+        self.reminder_tick = now;
+        let r = &self.store.reminders;
+        if self.reminder.is_some() {
+            if !r.on && !self.reminder_preview {
+                self.hide_reminder();
+            } else {
+                if self.inside {
+                    self.reminder_until += dt;
+                }
+                if now >= self.reminder_until {
+                    self.hide_reminder();
+                }
+            }
+        } else if r.on {
+            let every = r.minutes;
+            let due = match self.reminder_next {
+                Some((at, counted)) if counted == every => at,
+                _ => {
+                    let at = now + Duration::from_secs(every as u64 * 60);
+                    self.reminder_next = Some((at, every));
+                    at
+                }
+            };
+            let focusing = self.pomo.running() && !self.pomo.brk;
+            let calm = !focusing && !r.quiet_now() && !self.welcoming() && !self.hidden_for_fullscreen
+                && !self.open && !self.pinned && !self.peeking();
+            if now >= due && calm {
+                self.show_reminder(false);
             }
         }
         crate::sound::tick();
-        if self.prayer_ask.is_some() && self.prayer_ask_at.elapsed() > PRAYER_SHOWN {
+        let shown_for = if self.prayer_ask.is_some_and(|a| a.2) { HEADSUP_SHOWN } else { PRAYER_SHOWN };
+        if self.prayer_ask.is_some() && self.prayer_ask_at.elapsed() > shown_for {
             self.prayer_ask = None;
             crate::sound::stop();
         }
@@ -786,6 +1140,7 @@ impl App {
             crate::sound::play_chime();
         }
         self.check_tasks();
+        self.tick_settings();
         if self.pomo.finished() {
             unsafe {
                 let _ = MessageBeep(MB_ICONASTERISK);
@@ -807,8 +1162,11 @@ impl App {
             self.cursor = ((px - self.origin.x) as f32 / s, (py - self.origin.y) as f32 / s);
         }
         let shape = self.anim.value();
-        let notch = Rect::new(CX - shape.w / 2.0, 0.0, shape.w, shape.h);
-        self.inside = notch.grow(3.0).contains(self.cursor.0, self.cursor.1.max(0.0));
+        let notch = self.shape_rect(shape);
+        // (Hanging from the top, the screen's very top row counts too.)
+        let cy = if self.store.settings.docked && !self.store.settings.vertical { self.cursor.1.max(0.0) } else { self.cursor.1 };
+        self.inside = notch.grow(3.0).contains(self.cursor.0, cy);
+        self.follow_drag();
         let button_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
         // A button held while entering means something is being dragged in (files, usually).
         self.file_hover = self.inside && button_down && self.pressed.is_none() && (self.file_hover || !self.open || self.page == Page::Shelf);
@@ -827,8 +1185,11 @@ impl App {
             self.hover_since = None;
         }
         let rested = !self.over_maximized || self.open || self.hover_since.is_some_and(|t| now - t >= HOVER_REST);
-        let hover_opens = self.inside && rested && (!self.peeking() || self.open);
-        if hover_opens || self.form.is_some() || alerting {
+        if !self.inside {
+            self.hover_blocked = false;
+        }
+        let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none();
+        if hover_opens || self.form.is_some() || alerting || self.pinned {
             if !self.open {
                 trace(&format!("[open] hover {} rested {:?} over maximized {} form {} alert {}", hover_opens, self.hover_since.map(|t| (now - t).as_millis()), self.over_maximized, self.form.is_some(), alerting));
             }
@@ -855,7 +1216,7 @@ impl App {
         }
         if self.capture_until.is_some_and(|t| now >= t) {
             self.capture_until = None;
-            if self.store.settings.glass {
+            if self.glass_live {
                 win::exclude_from_capture(self.hwnd, true);
                 win::exclude_from_capture(self.overlay.hwnd, true);
                 win::exclude_from_capture(self.popup.hwnd, true);
@@ -865,7 +1226,7 @@ impl App {
         // Keep the glass fed with what's behind it; retry quietly if capture isn't available.
         // During a screenshot the capture would see us, so the glass keeps its last image.
         let mut backdrop_changed = false;
-        if self.store.settings.glass && self.capture_until.is_none() {
+        if self.glass_live && self.capture_until.is_none() {
             if !self.gfx.has_backdrop() && self.backdrop_retry.elapsed() > Duration::from_secs(3) {
                 self.backdrop_retry = now;
                 self.gfx.enable_backdrop();
@@ -885,9 +1246,10 @@ impl App {
         // Live stats feed the System page and the FPS overlay, and only run while shown.
         let overlay_on = self.store.settings.overlay;
         let on_system = self.open && self.page == Page::System;
-        self.sysmon.set_active(on_system || overlay_on);
+        let side_stats = self.store.settings.vertical && !self.open;
+        self.sysmon.set_active(on_system || overlay_on || side_stats);
         self.meter.set_active(self.track.as_ref().is_some_and(|t| t.playing));
-        if on_system || overlay_on {
+        if on_system || overlay_on || side_stats {
             self.stats_now = self.sysmon.get();
             if self.sample_fps() {
                 self.overlay.dirty = true;
@@ -903,7 +1265,8 @@ impl App {
 
         let animating = !self.anim.done();
         let playing = self.track.as_ref().is_some_and(|t| t.playing);
-        let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking() || self.popup.animating();
+        let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking() || self.popup.animating()
+            || self.drag.is_some() || self.press_drag.is_some();
         let sig = self.closed_signature();
         if busy || backdrop_changed || sig != self.closed_sig {
             self.closed_sig = sig;
@@ -1047,7 +1410,7 @@ impl App {
         }
         let g = &self.gfx;
         let pane = Rect::new(1.0, 1.0, OV_W - 2.0, OV_H - 2.0);
-        if self.store.settings.glass {
+        if self.glass_live {
             g.glass_rrect(pane, 18.0);
         } else {
             g.fill_rrect(pane, 18.0, rgba(8, 8, 12, 0.94));
@@ -1160,11 +1523,13 @@ impl App {
             Shape { w: cur.w.max(t.w) * 1.1, h: cur.h.max(t.h) * 1.1, r: 0.0, e: cur.e.max(t.e) }
         };
         let k = self.gfx.scale;
+        let b = self.shape_rect(s);
+        let e = if self.shape_radii(s).is_none() { s.e } else { 0.0 };
         let r = [
-            ((CX - s.w / 2.0 - s.e) * k).floor().max(0.0) as i32,
-            0,
-            ((CX + s.w / 2.0 + s.e) * k).ceil().min(WIN_W * k) as i32,
-            (s.h * k).ceil().min(WIN_H * k) as i32 + 1,
+            ((b.x - e) * k).floor().max(0.0) as i32,
+            (b.y * k).floor().max(0.0) as i32,
+            ((b.x + b.w + e) * k).ceil().min(WIN_W * k) as i32,
+            ((b.y + b.h) * k).ceil().min(WIN_H * k) as i32 + 1,
         ];
         if self.anim.done() {
             // At rest the region is the notch's exact outline. Besides clicks, it's what
@@ -1173,8 +1538,13 @@ impl App {
             if self.region_shape != Some(cur) {
                 self.region_shape = Some(cur);
                 self.region = r;
+                let b = self.shape_rect(cur);
+                let rgn = match self.shape_radii(cur) {
+                    None => notch_region(cur, b.x + b.w / 2.0, k),
+                    Some(radii) => slab_region(b, radii, k),
+                };
                 unsafe {
-                    SetWindowRgn(self.hwnd, notch_region(cur, k), false);
+                    SetWindowRgn(self.hwnd, rgn, false);
                 }
             }
             return;
@@ -1205,7 +1575,7 @@ impl App {
         } else {
             let page = ["music", "pomo", "water", "prayer", "download", "claude", "shelf", "todo", "system"][self.page.index()];
             let what = if !self.open {
-                if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else { "closed".to_owned() }
+                if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else if self.reminder.is_some() { "reminder-peek".to_owned() } else { "closed".to_owned() }
             } else if self.page == Page::Water && self.water_settings {
                 "water-settings".to_owned()
             } else if self.page == Page::Music && self.lyrics_on {
@@ -1250,14 +1620,36 @@ impl App {
     pub fn set_glass(&mut self, on: bool) {
         self.store.settings.glass = on;
         self.store.save();
-        if !on {
+        self.apply_glass();
+    }
+
+    /// "Show in screen sharing": while on, the notch is solid and shows up in shares and
+    /// recordings (for Discord and the like, which can't be told apart from just running).
+    pub fn share_visible(&self) -> bool {
+        self.share_visible
+    }
+
+    pub fn set_share_visible(&mut self, on: bool) {
+        self.share_visible = on;
+        self.apply_glass();
+    }
+
+    /// Whether the glass is live right now: chosen, and nothing asks for the notch to show
+    /// up in captures (the sharing option, or a recorder running).
+    fn apply_glass(&mut self) {
+        let want = self.store.settings.glass && !self.share_visible && !self.recorder;
+        if want == self.glass_live {
+            return;
+        }
+        self.glass_live = want;
+        if !want {
             self.gfx.disable_backdrop();
         }
         // Glass windows capture the screen behind themselves, so they must not appear in
-        // that capture; plain ones can show up in screenshots again.
-        win::exclude_from_capture(self.hwnd, on);
-        win::exclude_from_capture(self.overlay.hwnd, on);
-        win::exclude_from_capture(self.popup.hwnd, on);
+        // that capture; plain ones can show up in screenshots, shares and recordings.
+        win::exclude_from_capture(self.hwnd, want);
+        win::exclude_from_capture(self.overlay.hwnd, want);
+        win::exclude_from_capture(self.popup.hwnd, want);
         self.backdrop_retry = Instant::now() - Duration::from_secs(10);
         self.closed_sig.clear();
         self.overlay.dirty = true;
@@ -1276,8 +1668,15 @@ impl App {
         if self.open {
             return if self.page == Page::Music && self.lyrics_on { WIDE } else { PAGE };
         }
-        if self.welcoming() || self.peeking() {
+        if self.welcoming() || self.water_ask.is_some() || self.prayer_ask.is_some() {
             return PEEK;
+        }
+        if self.reminder.is_some() {
+            return self.reminder_card.0;
+        }
+        if self.store.settings.vertical {
+            let busy = self.track.as_ref().is_some_and(|t| t.playing) || self.pomo.running();
+            return if self.store.settings.minimal { V_MINIMAL } else if busy { V_COMPACT } else { V_IDLE };
         }
         // (Over a maximized window, not even the lyric line widens it.)
         if let Some(line) = self.closed_lyric().filter(|_| !self.over_maximized) {
@@ -1289,12 +1688,91 @@ impl App {
 
     /// The closed notch only needs redrawing when what it shows changes.
     fn closed_signature(&self) -> String {
-        format!("{}|{:?}|{}|{}|{:?}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal(), self.water_ask)
+        // (On a side it also shows the CPU and memory load.)
+        let stats = if self.store.settings.vertical { (self.stats_now.cpu * 100.0).round() as i32 * 1000 + self.ram_pct() } else { 0 };
+        format!("{}|{:?}|{}|{}|{:?}|{stats}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal(), self.water_ask)
     }
 
     /// A reminder (water or prayer) is showing in the notch.
     fn peeking(&self) -> bool {
-        self.water_ask.is_some() || self.prayer_ask.is_some()
+        self.water_ask.is_some() || self.prayer_ask.is_some() || self.reminder.is_some()
+    }
+
+    /// Days the Hijri date is moved by.
+    pub fn hijri_adjust(&self) -> i32 {
+        self.store.prayer.hijri_adjust
+    }
+
+    pub fn set_hijri_adjust(&mut self, days: i32) {
+        self.store.prayer.hijri_adjust = days.clamp(-2, 2);
+        self.store.save();
+    }
+
+    /// Asr by the Hanafi rule.
+    pub fn hanafi(&self) -> bool {
+        self.store.prayer.hanafi
+    }
+
+    pub fn set_hanafi(&mut self, on: bool) {
+        self.store.prayer.hanafi = on;
+        self.store.save();
+    }
+
+    /// The dhikr, du'a and Qur'an reminders' settings.
+    pub fn reminders(&self) -> crate::store::Reminders {
+        self.store.reminders.clone()
+    }
+
+    pub fn update_reminders(&mut self, change: impl FnOnce(&mut crate::store::Reminders)) {
+        change(&mut self.store.reminders);
+        self.store.save();
+    }
+
+    /// "Show one now": a card right away, even with the reminders off.
+    pub fn reminder_now(&mut self) {
+        self.show_reminder(true);
+    }
+
+    fn show_reminder(&mut self, preview: bool) {
+        let i = self.store.reminders.draw();
+        self.store.save();
+        self.reminder_card = self.fit_reminder(i);
+        self.reminder = Some(i);
+        self.reminder_preview = preview;
+        let now = Instant::now();
+        self.reminder_at = now;
+        self.reminder_total = Duration::from_secs(self.store.reminders.seconds.max(1) as u64);
+        self.reminder_until = now + self.reminder_total;
+        trace(&format!("[reminder] {i} for {} s", self.reminder_total.as_secs()));
+    }
+
+    /// The card leaves; the next one is counted from now.
+    fn hide_reminder(&mut self) {
+        self.reminder = None;
+        self.reminder_preview = false;
+        // (so it doesn't spring open under the mouse as the card goes)
+        self.hover_blocked = self.inside;
+        let every = self.store.reminders.minutes;
+        self.reminder_next = Some((Instant::now() + Duration::from_secs(every as u64 * 60), every));
+    }
+
+    /// The card for a reminder: as wide as Nova's, as tall as its words need (a long one
+    /// steps its font down until it fits), and the font size.
+    fn fit_reminder(&self, i: usize) -> (Shape, f32) {
+        let item = &REMINDERS[i];
+        let (text, spans) = reminder_words(item);
+        // Diacritics and Qur'anic marks add characters but no width.
+        let len = item.text.chars().filter(|c| !matches!(*c as u32, 0x64B..=0x65F | 0x670 | 0x6D6..=0x6ED)).count();
+        let mut fs: f32 = if len <= 40 { 30.0 } else if len <= 80 { 26.0 } else { 23.0 };
+        let w = if self.store.settings.vertical { REMINDER_W_SIDE } else { REMINDER_W };
+        // Inside: 12 padding, 24 head, 6 + 6 gaps, 16 source line, 16 bottom (and 2 spare).
+        let mut h = self.gfx.quran_height(&text, w - 44.0, fs, &spans);
+        while fs > 17.0 && h + 82.0 > REMINDER_MAX_H {
+            fs -= 2.0;
+            h = self.gfx.quran_height(&text, w - 44.0, fs, &spans);
+        }
+        let h = (h.ceil() + 82.0).min(REMINDER_MAX_H);
+        (Shape { w, h, r: 30.0, e: 20.0 }, fs)
     }
 
     fn alert(&mut self, page: Page) {
@@ -1409,6 +1887,10 @@ impl App {
 
     pub fn mouse_down(&mut self, x: f32, y: f32) {
         self.pressed = self.region_at(x, y).map(|a| (a, x, y));
+        // Away from the buttons a press may become a drag (once it moves).
+        if self.pressed.is_none() && self.form.is_none() {
+            self.press_drag = win::cursor_px();
+        }
         self.press_fx = self.pressed.map(|(a, _, _)| (a, Instant::now(), None));
         self.draw();
         if self.form.is_some() && self.pressed.is_none() {
@@ -1446,7 +1928,7 @@ impl App {
             return;
         }
         let (x, y) = self.cursor;
-        let lx = x - (CX - 210.0);
+        let (lx, y) = (x - self.ox.get(), y - self.oy.get());
         let down = delta < 0;
         if self.page == Page::Todo && lx > 198.0 && y > 30.0 && self.store.tasks.len() > 3 {
             let max = self.store.tasks.len() - 3;
@@ -1567,7 +2049,7 @@ impl App {
             }
             Drink => w.drink(),
             PrayerCity(d) => {
-                let n = crate::prayer::CITIES.len() as i32;
+                let n = crate::prayer::CHOICES as i32;
                 let p = &mut self.store.prayer;
                 p.city = (p.city as i32 + d).rem_euclid(n) as usize;
             }
@@ -1618,6 +2100,10 @@ impl App {
                 if let Some(Phase::Done(path)) = self.dl_job.as_ref().map(|j| j.status().phase) {
                     let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
                 }
+                save = false;
+            }
+            ReminderDismiss => {
+                self.hide_reminder();
                 save = false;
             }
             PrayerDismiss => {
@@ -1777,12 +2263,12 @@ impl App {
         }
         if self.gfx.fade.get() > 0.5 {
             let ox = self.ox.get();
-            self.regions.borrow_mut().push((Rect::new(r.x + ox, r.y, r.w, r.h), a));
+            self.regions.borrow_mut().push((Rect::new(r.x + ox, r.y + self.oy.get(), r.w, r.h), a));
         }
     }
 
     fn hovered(&self, r: Rect) -> bool {
-        r.contains(self.cursor.0 - self.ox.get(), self.cursor.1)
+        r.contains(self.cursor.0 - self.ox.get(), self.cursor.1 - self.oy.get())
     }
 
     pub fn draw(&mut self) {
@@ -1793,48 +2279,85 @@ impl App {
         self.regions.borrow_mut().clear();
         let s = self.anim.value();
         let g = &self.gfx;
-        let notch = Rect::new(CX - s.w / 2.0, 0.0, s.w, s.h);
-        if self.store.settings.glass {
-            g.glass(CX, s.w, s.h, s.r, s.e);
-        } else {
-            g.notch(CX, s.w, s.h, s.r, s.e, BLACK);
-        }
-        g.clip(Rect::new(notch.x - s.e, 0.0, s.w + 2.0 * s.e, s.h));
+        let notch = self.shape_rect(s);
+        let cx = notch.x + notch.w / 2.0;
+        let e = match self.shape_radii(s) {
+            None => {
+                if self.glass_live {
+                    g.glass(cx, s.w, s.h, s.r, s.e);
+                } else {
+                    g.notch(cx, s.w, s.h, s.r, s.e, BLACK);
+                }
+                s.e
+            }
+            Some(radii) => {
+                if self.glass_live {
+                    g.glass_slab(notch, radii);
+                } else {
+                    g.slab(notch, radii, BLACK);
+                }
+                0.0
+            }
+        };
+        g.clip(Rect::new(notch.x - e, notch.y, s.w + 2.0 * e, s.h));
+        // Everything inside is drawn from the notch's top.
+        g.set_dy(notch.y);
+        self.oy.set(notch.y);
+        let vertical = self.store.settings.vertical;
 
-        let open_a = ((s.h - 70.0) / 50.0).clamp(0.0, 1.0);
-        let closed_a = ((44.0 - s.h) / 12.0).clamp(0.0, 1.0);
+        // The reminder card is tall like a page, but it isn't one: no page fades in under it,
+        // nor as its shell shrinks back afterwards.
+        if self.open {
+            self.from_card.set(false);
+        } else if self.reminder.is_some() {
+            self.from_card.set(true);
+        }
+        // (Standing on a side, the closed notch is tall and narrow: width tells the states apart.)
+        let grown = if vertical { ((s.w - 200.0) / 150.0).clamp(0.0, 1.0) } else { ((s.h - 70.0) / 50.0).clamp(0.0, 1.0) };
+        let open_a = if self.from_card.get() { 0.0 } else { grown };
+        let closed_a = if vertical { ((90.0 - s.w) / 30.0).clamp(0.0, 1.0) } else { ((44.0 - s.h) / 12.0).clamp(0.0, 1.0) };
+        let peek_a = |full: f32| if vertical { ((s.w - 100.0) / 120.0).clamp(0.0, 1.0) } else { ((s.h - 34.0) / full).clamp(0.0, 1.0) };
         if open_a > 0.0 {
             let page_a = (self.page_at.elapsed().as_secs_f32() / 0.22).min(1.0);
             g.fade.set(open_a * page_a);
             // Content grows out of the top edge with the glass instead of being uncovered.
             let k = 0.9 + 0.1 * open_a;
             if self.page == Page::Music && self.lyrics_on && self.anim.to == WIDE {
-                self.ox.set(CX - 260.0);
-                g.transform(self.ox.get(), k, CX);
+                self.ox.set(cx - 260.0);
+                g.transform(self.ox.get(), k, cx);
                 self.lyrics_page();
             } else {
-                self.ox.set(CX - 210.0);
-                g.transform(self.ox.get(), k, CX);
+                self.ox.set(cx - 210.0);
+                g.transform(self.ox.get(), k, cx);
                 self.page_content();
             }
         }
-        if closed_a > 0.0 && s.h > 12.0 {
+        if closed_a > 0.0 && s.h > 12.0 && s.w > 12.0 {
             g.fade.set(closed_a);
             self.ox.set(0.0);
             g.offset(0.0);
             self.closed(s);
         }
         if self.anim.to == PEEK || (self.welcoming() && open_a == 0.0) {
-            let a = ((s.h - 34.0) / 20.0).clamp(0.0, 1.0);
+            let a = peek_a(20.0);
             if a > 0.0 {
                 g.fade.set(a);
-                self.ox.set(CX - PEEK.w / 2.0);
+                self.ox.set(notch.x + (s.w - PEEK.w) / 2.0);
                 g.offset(self.ox.get());
                 match (self.water_ask, self.prayer_ask) {
                     (Some(ask), _) if !self.welcoming() => self.water_ask_view(ask),
-                    (None, Some((i, at))) if !self.welcoming() => self.prayer_ask_view(i, at),
+                    (None, Some((i, at, soon))) if !self.welcoming() => self.prayer_ask_view(i, at, soon),
                     _ => self.welcome_view(),
                 }
+            }
+        }
+        if let Some(i) = self.reminder.filter(|_| self.anim.to == self.reminder_card.0) {
+            let a = peek_a(40.0);
+            if a > 0.0 {
+                g.fade.set(a);
+                self.ox.set(notch.x + (s.w - self.reminder_card.0.w) / 2.0);
+                g.offset(self.ox.get());
+                self.reminder_view(i);
             }
         }
         g.offset(0.0);
@@ -1949,7 +2472,7 @@ impl App {
     }
 
     /// A prayer time has come: a glowing crescent, the prayer's name, and an OK.
-    fn prayer_ask_view(&self, i: usize, at: i32) {
+    fn prayer_ask_view(&self, i: usize, at: i32, soon: bool) {
         let g = &self.gfx;
         let (cx, cy) = (32.0, 30.0);
         let t = self.prayer_ask_at.elapsed().as_secs_f32();
@@ -1963,11 +2486,62 @@ impl App {
 
         let ok = Rect::new(301.0 - (g.measure("OK", PILL_TEXT, 600) + 4.0 * PILL_PAD), 16.0, g.measure("OK", PILL_TEXT, 600) + 4.0 * PILL_PAD, 28.0);
         let time = win::hm_text((at / 60 % 24) as u16, (at % 60) as u16);
-        g.text(&format!("{} prayer", prayer::NAMES[i]), 60.0, 23.0, ok.x - 64.0, 14.0, 700, WHITE, Align::Start);
-        g.text(&format!("It's time to pray · {time}"), 60.0, 40.0, ok.x - 64.0, 10.5, 400, white(0.55), Align::Start);
+        let (title, sub) = if soon {
+            (format!("{} in {PRAYER_HEADSUP} minutes", prayer::NAMES[i]), format!("Get ready · {time}"))
+        } else {
+            (format!("{} prayer", prayer::NAMES[i]), format!("It's time to pray · {time}"))
+        };
+        g.text(&title, 60.0, 23.0, ok.x - 64.0, 14.0, 700, WHITE, Align::Start);
+        g.text(&sub, 60.0, 40.0, ok.x - 64.0, 10.5, 400, white(0.55), Align::Start);
         g.fill_rrect(ok, 14.0, if self.hovered(ok) { rgba(0xff, 0xc4, 0x3d, 0.4) } else { rgba(0xff, 0xc4, 0x3d, 0.28) });
         g.text("OK", ok.x, ok.y + 14.0, ok.w, PILL_TEXT, 600, AMBER, Align::Center);
         self.hit(ok, Action::PrayerDismiss);
+    }
+
+    /// A dhikr, du'a or verse, as a card sized to its words: its kind (a crescent and the
+    /// kind's name, in the kind's color) and a close button at the top, the words in the
+    /// Qur'an face, where they're from, and the time left as a thin bar (dimmed while the
+    /// mouse holds it).
+    fn reminder_view(&self, i: usize) {
+        let g = &self.gfx;
+        let item = &REMINDERS[i];
+        let (card, fs) = self.reminder_card;
+        let (w, h) = (card.w, card.h);
+        let accent = kind_color(item.kind);
+        let t = self.reminder_at.elapsed().as_secs_f32();
+        let breath = 0.5 + 0.5 * (t * std::f32::consts::TAU / 4.0).sin();
+        g.radial(w - 30.0, 0.0, 190.0, 120.0, rgba(0xff, 0xd4, 0x79, 0.10 + 0.04 * breath));
+        g.radial(30.0, h, 200.0, 140.0, [accent[0], accent[1], accent[2], 0.12 + 0.05 * breath]);
+
+        // The kind, on the right (the card reads right to left).
+        let name = ["\u{0622}\u{064a}\u{0629}", "\u{0630}\u{0643}\u{0631}", "\u{062f}\u{0639}\u{0627}\u{0621}"][item.kind as usize % 3];
+        let nw = g.measure(name, 12.0, 600);
+        let badge = Rect::new(w - 22.0 - (nw + 37.0), 13.0, nw + 37.0, 22.0);
+        g.fill_rrect(badge, 11.0, [accent[0], accent[1], accent[2], 0.14]);
+        g.fill_poly(&crescent(badge.x + badge.w - 15.0, 24.0, 6.0, (2.8, -1.9), 5.0), accent);
+        g.text(name, badge.x + 8.0, 24.0, badge.w - 35.0, 12.0, 600, accent, Align::Center);
+        let close = Rect::centered(34.0, 24.0, 24.0, 24.0);
+        let lit = self.hovered(close);
+        if lit {
+            g.fill_circle(34.0, 24.0, 12.0, white(0.14));
+        }
+        g.icon('\u{E711}', 34.0, 24.5, 9.0, white(if lit { 1.0 } else { 0.55 }));
+        self.hit(close, Action::ReminderDismiss);
+
+        let (text, spans) = reminder_words(item);
+        g.quran_text(&text, Rect::new(22.0, 42.0, w - 44.0, h - 80.0), fs, WHITE, &spans);
+        g.text(item.from, 22.0, h - 24.0, w - 44.0, 11.5, 500, white(0.6), Align::Center);
+
+        // The time left, running out toward the right.
+        let left = self.reminder_until.saturating_duration_since(Instant::now()).as_secs_f32();
+        let frac = (left / self.reminder_total.as_secs_f32().max(0.001)).clamp(0.0, 1.0);
+        let track = Rect::new(30.0, h - 9.0, w - 60.0, 2.0);
+        g.fill_rrect(track, 1.0, white(0.08));
+        if frac > 0.0 {
+            let bw = track.w * frac;
+            let held = if self.inside { 0.45 } else { 1.0 };
+            g.fill_rrect(Rect::new(track.x + track.w - bw, track.y, bw, 2.0), 1.0, [accent[0], accent[1], accent[2], held]);
+        }
     }
 
     /// Mascot eyes that glow, blink, then smile, next to a greeting.
@@ -2159,8 +2733,11 @@ impl App {
     // ----- closed notch -----------------------------------------------------------------
 
     fn closed(&self, s: Shape) {
+        if self.store.settings.vertical {
+            return self.closed_side(s);
+        }
         let g = &self.gfx;
-        let x0 = CX - s.w / 2.0;
+        let x0 = self.shape_rect(s).x;
         let cy = s.h / 2.0;
         let line = self.closed_lyric();
         if let Some(t) = self.track.as_ref().filter(|t| t.playing) {
@@ -2192,6 +2769,71 @@ impl App {
             let w = self.time_width(14.5, 600);
             self.time(x0 + (s.w - w) / 2.0, cy, 14.5, 600, white(0.95));
         }
+    }
+
+    /// The closed notch standing on a side: the time, the day, the CPU and memory load and
+    /// the next prayer down its length; with music, the cover, the bars and the time; with
+    /// a timer, its ring and what's left.
+    fn closed_side(&self, s: Shape) {
+        let g = &self.gfx;
+        if s.w < 30.0 {
+            return;
+        }
+        let b = self.shape_rect(s);
+        let cx = b.x + b.w / 2.0;
+        let w = b.w - 4.0;
+        let small = |text: &str, cy: f32, size: f32, weight: u32, c: Color| {
+            g.display(text, b.x + 2.0, cy, w, size, weight, c, Align::Center);
+        };
+        let hm = || {
+            let (t, _) = win::clock_parts();
+            t
+        };
+        if let Some(_t) = self.track.as_ref().filter(|t| t.playing) {
+            let lv = self.bar_levels();
+            let accent = self.art().map_or(WHITE, |(_, c)| *c);
+            let art = Rect::centered(cx, 32.0, 28.0, 28.0);
+            g.radial(cx, 32.0, 20.0 + 6.0 * lv[0], 20.0 + 6.0 * lv[0], [accent[0], accent[1], accent[2], 0.10 + 0.35 * lv[0]]);
+            if let Some((img, _)) = self.art() {
+                g.draw_image(img, art, 8.0, 1.0);
+            } else {
+                g.fill_rrect(art, 8.0, white(0.15));
+            }
+            self.bars(cx - 10.0, 68.0, &lv, accent);
+            small(&hm(), 100.0, 11.5, 600, white(0.95));
+        } else if self.pomo.running() {
+            let left = self.pomo.remaining();
+            let frac = left.as_secs_f32() / Pomo::total(self.pomo.brk).as_secs_f32();
+            g.stroke_circle(cx, 40.0, 11.0, 2.4, rgba(0xff, 0x4b, 0x55, 0.3));
+            g.arc(cx, 40.0, 11.0, 0.0, frac * 360.0, 2.4, RED);
+            small(&mmss(left.as_millis() as i64), 74.0, 11.5, 600, WHITE);
+            small(&hm(), 100.0, 10.0, 500, white(0.55));
+        } else {
+            let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][win::weekday() as usize % 7];
+            small(&hm(), 30.0, 12.0, 700, WHITE);
+            small(day, 45.0, 10.0, 500, white(0.55));
+            g.fill_rrect(Rect::new(cx - 9.0, 59.0, 18.0, 1.0), 0.5, white(0.16));
+            small("CPU", 75.0, 9.5, 500, white(0.55));
+            small(&format!("{}%", (self.stats_now.cpu * 100.0).round() as i32), 89.0, 12.0, 700, WHITE);
+            small("RAM", 110.0, 9.5, 500, white(0.55));
+            small(&format!("{}%", self.ram_pct()), 124.0, 12.0, 700, WHITE);
+            // The next prayer, and how long until it.
+            let place = self.prayer_place();
+            let calc = self.prayer_calc();
+            let (y, m, d, now) = prayer::local_now(&place);
+            let t = prayer::day_times(&place, y, m, d, calc);
+            let (i, at) = [0usize, 2, 3, 4, 5].iter().find(|&&i| t[i] * 60 > now).map_or((0, (t[0] + 1440) * 60), |&i| (i, t[i] * 60));
+            let left = (at - now).max(0) / 60;
+            g.fill_rrect(Rect::new(cx - 9.0, 143.0, 18.0, 1.0), 0.5, white(0.16));
+            small(prayer::NAMES[i], 160.0, 9.5, 500, rgba(0xff, 0xc4, 0x3d, 0.8));
+            small(&if left >= 60 { format!("{}h{:02}", left / 60, left % 60) } else { format!("{left}m") }, 174.0, 11.5, 700, AMBER);
+        }
+    }
+
+    /// Memory in use, as a percentage.
+    fn ram_pct(&self) -> i32 {
+        let s = &self.stats_now;
+        if s.ram_total == 0 { 0 } else { (s.ram_used as f64 * 100.0 / s.ram_total as f64).round() as i32 }
     }
 
     /// The bars' levels this frame: they follow the live sound (quick up, eased down), or
@@ -2625,14 +3267,61 @@ impl App {
 
     // ----- prayer times -----------------------------------------------------------------
 
+    /// The choices that change the times.
+    fn prayer_calc(&self) -> prayer::Calc {
+        prayer::Calc { hijri_adjust: self.store.prayer.hijri_adjust, hanafi: self.store.prayer.hanafi }
+    }
+
+    /// The place the prayer times are for.
+    fn prayer_place(&self) -> prayer::Place {
+        prayer::place(self.store.prayer.city, self.store.prayer.auto.as_ref())
+    }
+
+    /// With "Auto" chosen, looks the PC's place up once a day (in the background) and keeps
+    /// the answer; when every service fails, it tries again half an hour later.
+    fn keep_located(&mut self) {
+        if let Some(rx) = &self.locating {
+            match rx.try_recv() {
+                Ok(found) => {
+                    self.locating = None;
+                    if let Some(found) = found {
+                        trace(&format!("[prayer] located: {} ({})", found.city, found.country));
+                        self.store.prayer.auto = Some(found);
+                        self.store.save();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.locating = None,
+                Err(_) => {}
+            }
+            return;
+        }
+        let stale = self.store.prayer.auto.as_ref().map_or(true, |a| a.day != prayer::today_key());
+        if self.store.prayer.city >= prayer::AUTO && stale && self.locate_at.elapsed() > Duration::from_secs(30 * 60) {
+            self.locate_at = Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(prayer::detect());
+            });
+            self.locating = Some(rx);
+        }
+    }
+
     fn prayer_page(&self) {
         let g = &self.gfx;
         self.header("Prayer ", Some(("Times", AMBER)));
-        let n = prayer::CITIES.len();
-        let (city, lat, lon) = prayer::CITIES[self.store.prayer.city.min(n - 1)];
-        let (y, m, d, tz) = prayer::today();
-        let mut t = prayer::minutes(prayer::times(y, m, d, lat, lon, tz));
-        let mut now = win::seconds_of_day() as i32;
+        let place = self.prayer_place();
+        let auto = self.store.prayer.city >= prayer::AUTO;
+        let city = match (auto, &self.store.prayer.auto) {
+            (true, Some(a)) => format!("Auto · {}", a.city),
+            (true, None) if place.approx => format!("Auto · ~{}", place.name),
+            (true, None) => "Auto · finding\u{2026}".to_owned(),
+            (false, _) => place.name.clone(),
+        };
+        let city = city.as_str();
+        // The day and the clock at the place (its own time zone, like a mosque timetable).
+        let calc = self.prayer_calc();
+        let (y, m, d, mut now) = prayer::local_now(&place);
+        let mut t = prayer::day_times(&place, y, m, d, calc);
 
         // The next of the five prayers (sunrise is listed but isn't one), and the one before
         // it, in seconds since today's midnight. After Isha, the next is tomorrow's Fajr.
@@ -2646,7 +3335,7 @@ impl App {
                 // Past Isha: show tomorrow's day, counting from a midnight already behind us.
                 let (y2, m2, d2) = prayer::next_day(y, m, d);
                 let isha = t[5];
-                t = prayer::minutes(prayer::times(y2, m2, d2, lat, lon, tz));
+                t = prayer::day_times(&place, y2, m2, d2, calc);
                 now -= 86400;
                 (0, t[0] * 60, (isha - 1440) * 60)
             }
@@ -2654,6 +3343,10 @@ impl App {
 
         // Left: the next prayer, when, how long until it, and the city.
         g.text("Next prayer", 44.0, 41.0, 150.0, 10.5, 500, white(0.55), Align::Start);
+        // Today's Hijri date, small, at the other end of the line.
+        if let Some((hijri, _)) = prayer::hijri(y, m, d, calc.hijri_adjust) {
+            g.text(&hijri, 100.0, 41.0, 96.0, 10.0, 500, rgba(0xff, 0xc4, 0x3d, 0.75), Align::End);
+        }
         let nw = g.text(prayer::NAMES[next], 44.0, 60.0, 150.0, 21.0, 700, WHITE, Align::Start);
         let at = next_at / 60 % 1440;
         g.display(&win::hm_text((at / 60) as u16, (at % 60) as u16), 44.0 + nw + 8.0, 61.5, 100.0, 12.5, 600, white(0.6), Align::Start);
@@ -2904,7 +3597,7 @@ impl App {
         let v = self.popup.shown;
         g.push_layer(v.clamp(0.0, 1.0).powf(0.8), 0.9 + 0.1 * v, PP_W / 2.0, 0.0, -18.0 * (1.0 - v));
         let pane = Rect::new(1.0, 1.0, PP_W - 2.0, PP_H - 2.0);
-        if self.store.settings.glass {
+        if self.glass_live {
             g.glass_rrect(pane, 26.0);
         } else {
             g.fill_rrect(pane, 26.0, rgba(8, 8, 12, 0.95));
@@ -3423,6 +4116,56 @@ fn state_label(st: claude::State) -> (&'static str, Color) {
 
 /// A crescent's outline: the disc of radius `r` at (`cx`, `cy`) less a disc of radius
 /// `cut` shifted by `off` from it.
+/// Each kind's color on its card: a verse gold, a dhikr teal, a du'a violet.
+fn kind_color(kind: u8) -> Color {
+    match kind {
+        0 => rgb(0xff, 0xd4, 0x79),
+        1 => rgb(0x5e, 0xea, 0xd4),
+        _ => rgb(0xa7, 0x8b, 0xfa),
+    }
+}
+
+/// A reminder's words as drawn: the Qur'an's between ornate brackets, with each verse
+/// number as the verse-end ornament (the Qur'an face draws U+06DD and the number after it
+/// as one), both in the kind's color; commas in the UI font (the Qur'an face draws them as
+/// verse-end circles).
+fn reminder_words(item: &crate::reminders_data::Reminder) -> (String, Vec<gfx::Span>) {
+    let accent = kind_color(item.kind);
+    let mut out = String::new();
+    let mut spans = Vec::new();
+    let mut push = |out: &mut String, s: &str, color: Option<Color>, ui_font: Option<f32>| {
+        let start = out.encode_utf16().count() as u32;
+        out.push_str(s);
+        if let Some(color) = color {
+            spans.push(gfx::Span { start, len: s.encode_utf16().count() as u32, color, ui_font });
+        }
+    };
+    if item.quran {
+        push(&mut out, "\u{FD3F}\u{2009}", Some(accent), None);
+    }
+    for (k, word) in item.text.split(' ').enumerate() {
+        if k > 0 {
+            push(&mut out, " ", None, None);
+        }
+        let number = item.quran && (1..=3).contains(&word.chars().count()) && word.chars().all(|c| ('\u{0660}'..='\u{0669}').contains(&c));
+        if number {
+            push(&mut out, &format!("\u{06DD}{word}"), Some(accent), None);
+            continue;
+        }
+        let mut rest = word;
+        while let Some(at) = rest.find('\u{060C}') {
+            push(&mut out, &rest[..at], None, None);
+            push(&mut out, "\u{060C}", Some(white(0.6)), Some(0.7));
+            rest = &rest[at + '\u{060C}'.len_utf8()..];
+        }
+        push(&mut out, rest, None, None);
+    }
+    if item.quran {
+        push(&mut out, "\u{2009}\u{FD3E}", Some(accent), None);
+    }
+    (out, spans)
+}
+
 fn crescent(cx: f32, cy: f32, r: f32, off: (f32, f32), cut: f32) -> Vec<(f32, f32)> {
     let inside_cut = |x: f32, y: f32| (x - cx - off.0).hypot(y - cy - off.1) < cut;
     // The middle of the lit part faces away from the cut.
@@ -3648,11 +4391,40 @@ fn foreground_is_maximized(notch: HWND, ours: &[HWND]) -> bool {
     }
 }
 
+/// A free-standing shape's outline as a window region (see `notch_region`): its rounded
+/// corners as drawn, square ones where it touches a screen edge (carried past the window's
+/// side, where the region is cut anyway).
+fn slab_region(b: Rect, radii: [f32; 4], k: f32) -> windows::Win32::Graphics::Gdi::HRGN {
+    use windows::Win32::Graphics::Gdi::CreateRoundRectRgn;
+    const PAD: f32 = 2.0;
+    let r = radii.iter().cloned().fold(0.0, f32::max);
+    let (mut l, t, mut rt, btm) = (b.x - PAD, b.y - PAD, b.x + b.w + PAD, b.y + b.h + PAD);
+    if radii[0] == 0.0 && radii[3] == 0.0 {
+        l -= r + PAD;
+    }
+    if radii[1] == 0.0 && radii[2] == 0.0 {
+        rt += r + PAD;
+    }
+    let d = ((r + PAD) * 2.0 * k).round() as i32;
+    unsafe { CreateRoundRectRgn((l * k).floor() as i32, (t * k).floor() as i32, (rt * k).ceil() as i32 + 1, (btm * k).ceil() as i32 + 1, d, d) }
+}
+
+/// The screen nearest a point: its bounds, and its work area (without the taskbar).
+fn monitor_at(p: (i32, i32)) -> (windows::Win32::Foundation::RECT, windows::Win32::Foundation::RECT) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let m = MonitorFromPoint(POINT { x: p.0, y: p.1 }, MONITOR_DEFAULTTONEAREST);
+        let _ = GetMonitorInfoW(m, &mut info);
+    }
+    (info.rcMonitor, info.rcWork)
+}
+
 /// The notch's outline (ears, sides, rounded bottom) as a window region, in physical px.
 /// Regions have no anti-aliasing: they cut on whole pixels. So this one runs `PAD` dp
 /// outside the drawn shape, leaving its soft edge intact, and only the transparent
 /// margin past it gets cut.
-fn notch_region(s: Shape, k: f32) -> windows::Win32::Graphics::Gdi::HRGN {
+fn notch_region(s: Shape, cx: f32, k: f32) -> windows::Win32::Graphics::Gdi::HRGN {
     use std::f32::consts::{FRAC_PI_2, PI};
     use windows::Win32::Graphics::Gdi::{CreatePolygonRgn, WINDING};
     const PAD: f32 = 2.0;
@@ -3660,7 +4432,7 @@ fn notch_region(s: Shape, k: f32) -> windows::Win32::Graphics::Gdi::HRGN {
     let e0 = s.e.min(s.h - rr0).max(0.0);
     // Offsetting the outline outward: sides and bottom move out, the bottom corners keep
     // their centers (radius grows), the concave ears keep theirs (radius shrinks).
-    let (l, r, h) = (CX - s.w / 2.0 - PAD, CX + s.w / 2.0 + PAD, s.h + PAD);
+    let (l, r, h) = (cx - s.w / 2.0 - PAD, cx + s.w / 2.0 + PAD, s.h + PAD);
     let rr = rr0 + PAD;
     let e = (e0 - PAD).max(0.0);
     let mut pts = Vec::new();

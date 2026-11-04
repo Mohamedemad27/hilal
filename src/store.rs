@@ -276,11 +276,20 @@ pub struct Settings {
     pub shrink_over_maximized: bool,
     /// Or hide it altogether there (as in full screen).
     pub hide_over_maximized: bool,
+    /// Where the notch is (moved Nova Island's way, by dragging it): the top-center of the
+    /// closed notch in screen pixels (None: the top center of the main screen), or in
+    /// vertical mode the middle of its side.
+    pub anchor: Option<(i32, i32)>,
+    /// Hanging from the top edge (where it docks when dropped near it), else floating.
+    pub docked: bool,
+    /// Standing on the left or right edge of the screen instead.
+    pub vertical: bool,
+    pub side_left: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true, shrink_over_maximized: true, hide_over_maximized: false }
+        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true, shrink_over_maximized: true, hide_over_maximized: false, anchor: None, docked: true, vertical: false, side_left: false }
     }
 }
 
@@ -292,12 +301,122 @@ pub struct Prayer {
     pub city: usize,
     pub alerts: bool,
     pub alerted: (u32, usize),
+    /// The last heads-up shown before a prayer (yyyymmdd, prayer index).
+    pub headsup: (u32, usize),
+    /// Where "Auto" found this PC, and when.
+    pub auto: Option<AutoPlace>,
+    /// Days to move the Hijri date by (-2 to 2), for a local moon sighting.
+    pub hijri_adjust: i32,
+    /// Asr by the Hanafi shadow rule (twice the length).
+    pub hanafi: bool,
 }
 
 impl Default for Prayer {
     fn default() -> Self {
-        Self { city: 0, alerts: true, alerted: (0, 0) }
+        Self { city: 0, alerts: true, alerted: (0, 0), headsup: (0, 0), auto: None, hijri_adjust: 0, hanafi: false }
     }
+}
+
+/// The dhikr, du'a and Qur'an reminders (as Nova Island has them): on or off, every how
+/// many minutes, for how many seconds, which kinds, and quiet hours (minutes after
+/// midnight; they may wrap past it). The texts come from a shuffled bag, so none repeats
+/// before every one has been shown.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Reminders {
+    pub on: bool,
+    pub minutes: u32,
+    pub seconds: u32,
+    pub ayah: bool,
+    pub dhikr: bool,
+    pub dua: bool,
+    pub quiet_hours: bool,
+    pub quiet_from: u32,
+    pub quiet_to: u32,
+    /// What's left in the bag (indexes into `REMINDERS`), and the last one shown.
+    pub bag: Vec<usize>,
+    pub last: Option<usize>,
+}
+
+impl Default for Reminders {
+    fn default() -> Self {
+        Self {
+            on: true,
+            minutes: 5,
+            seconds: 30,
+            ayah: true,
+            dhikr: true,
+            dua: true,
+            quiet_hours: false,
+            quiet_from: 23 * 60,
+            quiet_to: 7 * 60,
+            bag: Vec::new(),
+            last: None,
+        }
+    }
+}
+
+/// The steps the interval and the time on screen can take (Nova's).
+pub const REMIND_EVERY: [u32; 14] = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240];
+pub const REMIND_FOR: [u32; 10] = [10, 15, 20, 30, 45, 60, 90, 120, 180, 300];
+
+impl Reminders {
+    /// Within the quiet hours, when they're on.
+    pub fn quiet_now(&self) -> bool {
+        let m = crate::win::seconds_of_day() / 60;
+        let (from, to) = (self.quiet_from, self.quiet_to);
+        self.quiet_hours && if from <= to { m >= from && m < to } else { m >= from || m < to }
+    }
+
+    /// The next one to show (an index into `REMINDERS`), out of the shuffled bag of the
+    /// kinds that are on (all of them, if none is).
+    pub fn draw(&mut self) -> usize {
+        use crate::reminders_data::REMINDERS;
+        // HILAL_REMINDER_TEST=<index> shows that one (for testing).
+        if let Some(i) = std::env::var("HILAL_REMINDER_TEST").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&i| i < REMINDERS.len()) {
+            return i;
+        }
+        let kinds = [self.ayah, self.dhikr, self.dua];
+        let mut pool: Vec<usize> = (0..REMINDERS.len()).filter(|&i| kinds[REMINDERS[i].kind as usize]).collect();
+        if pool.is_empty() {
+            pool = (0..REMINDERS.len()).collect();
+        }
+        self.bag.retain(|i| pool.contains(i));
+        if self.bag.is_empty() {
+            shuffle(&mut pool);
+            if pool.len() > 1 && Some(pool[0]) == self.last {
+                pool.rotate_left(1);
+            }
+            self.bag = pool;
+        }
+        let next = self.bag.remove(0);
+        self.last = Some(next);
+        next
+    }
+}
+
+/// Shuffles in place (Fisher-Yates, seeded from the clock: good enough to vary the order).
+fn shuffle(v: &mut [usize]) {
+    let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9e37_79b9, |d| d.as_nanos() as u64) | 1;
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+}
+
+/// A place found from the PC's internet address, on the day `day` (yyyymmdd).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AutoPlace {
+    pub city: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub country: String,
+    /// IANA time zone ("Asia/Riyadh"); empty (older saves) means the PC's own.
+    #[serde(default)]
+    pub tz: String,
+    pub day: u32,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -305,6 +424,7 @@ impl Default for Prayer {
 pub struct Store {
     pub tasks: Vec<Task>,
     pub water: Water,
+    pub reminders: Reminders,
     pub prayer: Prayer,
     pub shelf: Vec<PathBuf>,
     pub settings: Settings,

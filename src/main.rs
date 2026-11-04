@@ -8,6 +8,7 @@ mod claude;
 mod claude_app;
 mod download;
 mod prayer;
+mod reminders_data;
 mod shell;
 mod sound;
 mod store;
@@ -19,7 +20,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 
-use windows::core::{w, Result, PCWSTR};
+use windows::core::{w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleInitialize;
@@ -32,7 +33,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use ui::{App, OV_W, WIN_H, WIN_W};
+use ui::{App, OV_W, SW_H, SW_W, WAKE_H, WIN_H, WIN_W};
 
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted by the mouse hook when the cursor nears the notch; it only wakes the loop.
@@ -50,10 +51,38 @@ const MENU_BELLS: usize = 8;
 const MENU_MAX_SHRINK: usize = 9;
 const MENU_MAX_KEEP: usize = 10;
 const MENU_MAX_HIDE: usize = 11;
+const MENU_SHARE: usize = 12;
+const MENU_REM_ON: usize = 13;
+const MENU_REM_NOW: usize = 14;
+const MENU_REM_AYAH: usize = 15;
+const MENU_REM_DHIKR: usize = 16;
+const MENU_REM_QUIET: usize = 17;
+const MENU_REM_DUA: usize = 21;
+/// The reminders' interval (one per step of `store::REMIND_EVERY`), time on screen (per
+/// `REMIND_FOR`), and quiet hours' start and end (per hour).
+const MENU_REM_EVERY: usize = 40;
+const MENU_REM_FOR: usize = 60;
+const MENU_REM_FROM: usize = 80;
+const MENU_REM_TO: usize = 110;
+const MENU_VERTICAL: usize = 18;
+const MENU_RESET_POS: usize = 19;
+/// Hijri date adjustment, -2 to +2 days (MENU_HIJRI + 2 is "none").
+const MENU_HIJRI: usize = 30;
+const MENU_HANAFI: usize = 35;
+const MENU_SETTINGS: usize = 36;
+/// The id of the Ctrl+Alt+H hotkey.
+const HOTKEY_OPEN: i32 = 1;
 
 static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Bottom edge of the area (physical px) where cursor moves should wake the loop.
-static WAKE_ZONE: AtomicI32 = AtomicI32::new(0);
+/// Where the mouse wakes the notch (screen px: left, top, right, bottom), around its window.
+static WAKE_ZONE: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+
+pub fn set_wake_zone(r: [i32; 4]) {
+    for (z, v) in WAKE_ZONE.iter().zip(r) {
+        z.store(v, Ordering::Relaxed);
+    }
+}
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 /// The screenshot key currently held back, so its key-up is held back too.
 static HELD_KEY: AtomicU32 = AtomicU32::new(0);
@@ -103,7 +132,9 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if info.pt.y <= WAKE_ZONE.load(Ordering::Relaxed) && !WAKE_PENDING.swap(true, Ordering::AcqRel) {
+        let z = WAKE_ZONE.each_ref().map(|v| v.load(Ordering::Relaxed));
+        let near = info.pt.x >= z[0] && info.pt.y >= z[1] && info.pt.x <= z[2] && info.pt.y <= z[3];
+        if near && !WAKE_PENDING.swap(true, Ordering::AcqRel) {
             let hwnd = HWND(NOTCH_HWND.load(Ordering::Relaxed) as _);
             let _ = PostMessageW(hwnd, WM_WAKE, WPARAM(0), LPARAM(0));
         }
@@ -241,16 +272,27 @@ fn main() -> Result<()> {
             None,
         )?;
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let overlay_default = (screen_w - ((OV_W + 24.0) * scale) as i32, (WIN_H * scale) as i32);
+        let overlay_default = (screen_w - ((OV_W + 24.0) * scale) as i32, (WAKE_H * scale) as i32);
         APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, gfx, origin, overlay, overlay_default, popup)));
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
-        WAKE_ZONE.store((WIN_H * scale) as i32 + 40, Ordering::Relaxed);
         start_mouse_hook();
         DragAcceptFiles(hwnd, true);
         add_tray(hwnd);
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        with_app(|a| a.apply_position());
+        // Ctrl+Alt+H opens (or closes) the notch from anywhere.
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT};
+            if RegisterHotKey(hwnd, HOTKEY_OPEN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H' as u32).is_err() {
+                ui::trace("[hotkey] Ctrl+Alt+H is taken by another app");
+            }
+        }
         with_app(|a| a.welcome(false));
+        // HILAL_SETTINGS_TEST opens the Settings window at once (for testing).
+        if std::env::var_os("HILAL_SETTINGS_TEST").is_some() {
+            with_app(|a| a.open_settings());
+        }
         // Whenever another window comes to the front, make sure we're still above it.
         let _ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT);
 
@@ -387,16 +429,68 @@ fn tray_menu(hwnd: HWND) {
     let minimal = with_app(|a| a.minimal_setting()).unwrap_or(false);
     let max_mode = with_app(|a| a.maximized_mode()).unwrap_or(1);
     let glass = with_app(|a| a.glass()).unwrap_or(false);
+    let share = with_app(|a| a.share_visible()).unwrap_or(false);
+    let rem = with_app(|a| a.reminders()).unwrap_or_default();
+    let vertical = with_app(|a| a.vertical()).unwrap_or(false);
+    let hijri = with_app(|a| a.hijri_adjust()).unwrap_or(0);
+    let hanafi = with_app(|a| a.hanafi()).unwrap_or(false);
     let overlay = with_app(|a| a.overlay_shown()).unwrap_or(false);
     let fullscreen = with_app(|a| a.hide_in_fullscreen()).unwrap_or(true);
     let start = win::starts_with_windows();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings\u{2026}"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, check(start), MENU_START, w!("Start with Windows"));
         let _ = AppendMenuW(menu, check(glass), MENU_GLASS, w!("Liquid Glass"));
+        let _ = AppendMenuW(menu, check(share), MENU_SHARE, w!("Show in screen sharing"));
         let _ = AppendMenuW(menu, check(minimal), MENU_MINIMAL, w!("Minimal notch"));
         let _ = AppendMenuW(menu, check(overlay), MENU_OVERLAY, w!("FPS overlay"));
+        // Dhikr, du'a and Qur'an: on or off, how often, for how long, which kinds, quiet hours.
+        if let Ok(sub) = CreatePopupMenu() {
+            let _ = AppendMenuW(sub, check(rem.on), MENU_REM_ON, w!("On"));
+            let _ = AppendMenuW(sub, MF_STRING, MENU_REM_NOW, w!("Show one now"));
+            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, None);
+            let steps = |items: &[u32], chosen: u32, first: usize, label: &dyn Fn(u32) -> String| {
+                let Ok(m) = CreatePopupMenu() else { return None };
+                for (k, &v) in items.iter().enumerate() {
+                    let _ = AppendMenuW(m, check(v == chosen), first + k, &HSTRING::from(label(v)));
+                }
+                Some(m)
+            };
+            let mins = |v: u32| if v < 60 { format!("{v} min") } else if v % 60 == 0 { format!("{} h", v / 60) } else { format!("{} h {} min", v / 60, v % 60) };
+            if let Some(m) = steps(&store::REMIND_EVERY, rem.minutes, MENU_REM_EVERY, &|v| format!("Every {}", mins(v))) {
+                let _ = AppendMenuW(sub, MF_POPUP, m.0 as usize, &HSTRING::from(format!("Every {}", mins(rem.minutes))));
+            }
+            let secs = |v: u32| if v < 60 { format!("{v} s") } else if v % 60 == 0 { format!("{} min", v / 60) } else { format!("{} min {} s", v / 60, v % 60) };
+            if let Some(m) = steps(&store::REMIND_FOR, rem.seconds, MENU_REM_FOR, &|v| format!("For {}", secs(v))) {
+                let _ = AppendMenuW(sub, MF_POPUP, m.0 as usize, &HSTRING::from(format!("On screen for {}", secs(rem.seconds))));
+            }
+            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(sub, check(rem.ayah), MENU_REM_AYAH, w!("Qur'an verses"));
+            let _ = AppendMenuW(sub, check(rem.dhikr), MENU_REM_DHIKR, w!("Dhikr"));
+            let _ = AppendMenuW(sub, check(rem.dua), MENU_REM_DUA, w!("Du'a"));
+            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, None);
+            let hours: Vec<u32> = (0..24).map(|h| h * 60).collect();
+            let at = |m: u32| format!("{:02}:{:02}", m / 60, m % 60);
+            let _ = AppendMenuW(sub, check(rem.quiet_hours), MENU_REM_QUIET, &HSTRING::from(format!("Quiet hours ({} \u{2013} {})", at(rem.quiet_from), at(rem.quiet_to))));
+            if rem.quiet_hours {
+                if let Some(m) = steps(&hours, rem.quiet_from, MENU_REM_FROM, &|v| at(v)) {
+                    let _ = AppendMenuW(sub, MF_POPUP, m.0 as usize, &HSTRING::from(format!("From {}", at(rem.quiet_from))));
+                }
+                if let Some(m) = steps(&hours, rem.quiet_to, MENU_REM_TO, &|v| at(v)) {
+                    let _ = AppendMenuW(sub, MF_POPUP, m.0 as usize, &HSTRING::from(format!("To {}", at(rem.quiet_to))));
+                }
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Dhikr & Qur'an reminders"));
+        }
+        // Where it is: drag it anywhere; or stand it on a side edge; or put it back.
+        if let Ok(sub) = CreatePopupMenu() {
+            let _ = AppendMenuW(sub, check(vertical), MENU_VERTICAL, w!("Vertical (dock left / right)"));
+            let _ = AppendMenuW(sub, MF_STRING, MENU_RESET_POS, w!("Reset position"));
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Position"));
+        }
         // Over maximized windows: one of three.
         if let Ok(sub) = CreatePopupMenu() {
             let _ = AppendMenuW(sub, check(max_mode == 0), MENU_MAX_KEEP, w!("Stay as it is"));
@@ -406,6 +500,14 @@ fn tray_menu(hwnd: HWND) {
         }
         let _ = AppendMenuW(menu, check(fullscreen), MENU_FULLSCREEN, w!("Hide in full screen"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        // The Hijri date, moved a day or two for a local moon sighting.
+        if let Ok(sub) = CreatePopupMenu() {
+            for (k, name) in [w!("\u{2212}2 days"), w!("\u{2212}1 day"), w!("None"), w!("+1 day"), w!("+2 days")].into_iter().enumerate() {
+                let _ = AppendMenuW(sub, check(hijri == k as i32 - 2), MENU_HIJRI + k, name);
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Hijri date adjustment"));
+        }
+        let _ = AppendMenuW(menu, check(hanafi), MENU_HANAFI, w!("Asr by the Hanafi rule"));
         let adhan = sound::adhan().is_some();
         let _ = AppendMenuW(menu, check(adhan), MENU_ADHAN, w!("Adhan sound\u{2026}"));
         if adhan {
@@ -422,6 +524,54 @@ fn tray_menu(hwnd: HWND) {
             MENU_START => win::set_start_with_windows(!start),
             MENU_MINIMAL => {
                 with_app(|a| a.set_minimal(!minimal));
+            }
+            MENU_REM_ON => {
+                with_app(|a| a.update_reminders(|r| r.on = !r.on));
+            }
+            MENU_REM_NOW => {
+                with_app(|a| a.reminder_now());
+            }
+            MENU_REM_AYAH => {
+                with_app(|a| a.update_reminders(|r| r.ayah = !r.ayah));
+            }
+            MENU_REM_DHIKR => {
+                with_app(|a| a.update_reminders(|r| r.dhikr = !r.dhikr));
+            }
+            MENU_REM_DUA => {
+                with_app(|a| a.update_reminders(|r| r.dua = !r.dua));
+            }
+            MENU_REM_QUIET => {
+                with_app(|a| a.update_reminders(|r| r.quiet_hours = !r.quiet_hours));
+            }
+            c if (MENU_REM_EVERY..MENU_REM_EVERY + store::REMIND_EVERY.len()).contains(&c) => {
+                with_app(|a| a.update_reminders(|r| r.minutes = store::REMIND_EVERY[c - MENU_REM_EVERY]));
+            }
+            c if (MENU_REM_FOR..MENU_REM_FOR + store::REMIND_FOR.len()).contains(&c) => {
+                with_app(|a| a.update_reminders(|r| r.seconds = store::REMIND_FOR[c - MENU_REM_FOR]));
+            }
+            c if (MENU_REM_FROM..MENU_REM_FROM + 24).contains(&c) => {
+                with_app(|a| a.update_reminders(|r| r.quiet_from = (c - MENU_REM_FROM) as u32 * 60));
+            }
+            c if (MENU_REM_TO..MENU_REM_TO + 24).contains(&c) => {
+                with_app(|a| a.update_reminders(|r| r.quiet_to = (c - MENU_REM_TO) as u32 * 60));
+            }
+            MENU_VERTICAL => {
+                with_app(|a| a.set_vertical(!vertical));
+            }
+            MENU_RESET_POS => {
+                with_app(|a| a.reset_position());
+            }
+            MENU_SHARE => {
+                with_app(|a| a.set_share_visible(!share));
+            }
+            MENU_SETTINGS => {
+                with_app(|a| a.open_settings());
+            }
+            MENU_HANAFI => {
+                with_app(|a| a.set_hanafi(!hanafi));
+            }
+            c @ MENU_HIJRI..=34 => {
+                with_app(|a| a.set_hijri_adjust(c as i32 - MENU_HIJRI as i32 - 2));
             }
             MENU_GLASS => {
                 with_app(|a| a.set_glass(!glass));
@@ -497,6 +647,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
     let handled = match msg {
         WM_WAKE => Some(()),
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_OPEN => with_app(|a| a.hotkey()),
         WM_SETTINGCHANGE => {
             win::refresh_time_format();
             None
@@ -553,6 +704,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if a.gfx.resize(gfx::MAIN, WIN_W, WIN_H, scale, (a.origin.x, a.origin.y)).is_ok() {
                 a.draw();
             }
+            // (back to the chosen spot along the top)
+            a.apply_position();
         }),
         WM_DESTROY => {
             // Tear down while the window still exists: the tray icon, then the app with its
@@ -611,6 +764,104 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 }
 
 /// The Claude session popup: drag it by its header, close it with its button.
+/// Creates the Settings window (hidden; the app sizes, fills and shows it).
+pub fn create_settings_window() -> Option<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(settings_proc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).ok()?,
+            hIcon: app_icon(false),
+            hIconSm: app_icon(true),
+            lpszClassName: w!("HilalSettings"),
+            ..Default::default()
+        };
+        RegisterClassExW(&class);
+        CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
+            w!("HilalSettings"),
+            w!("Hilal Settings"),
+            WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
+            0,
+            0,
+            (SW_W) as i32,
+            (SW_H) as i32,
+            None,
+            None,
+            instance,
+            None,
+        )
+        .ok()
+    }
+}
+
+extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+    match msg {
+        WM_NCHITTEST => {
+            let mut p = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+            }
+            let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let drag = with_app(|a| a.settings_drags(p.x as f32 / scale, p.y as f32 / scale)).unwrap_or(false);
+            return LRESULT(if drag { HTCAPTION } else { HTCLIENT } as isize);
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = dp(hwnd, lparam);
+            let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            unsafe {
+                let _ = TrackMouseEvent(&mut track);
+            }
+            with_app(|a| a.settings_hover(x, y));
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            with_app(|a| a.settings_hover(-1.0, -1.0));
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = dp(hwnd, lparam);
+            with_app(|a| a.settings_down(x, y));
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = dp(hwnd, lparam);
+            // The adhan's file dialog runs its own message loop: not while the app is borrowed.
+            if let Some(Some(ui::SettingsAfter::PickAdhan)) = with_app(|a| a.settings_up(x, y)) {
+                if let Some(path) = pick_audio(hwnd) {
+                    if sound::set_adhan(Some(&path)).is_ok() {
+                        sound::play_prayer();
+                    }
+                }
+                with_app(|a| a.draw_settings());
+            }
+            return LRESULT(0);
+        }
+        WM_MOUSEWHEEL => {
+            with_app(|a| a.settings_wheel(((wparam.0 >> 16) & 0xffff) as i16 as i32));
+            return LRESULT(0);
+        }
+        WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
+            with_app(|a| a.close_settings());
+            return LRESULT(0);
+        }
+        WM_EXITSIZEMOVE => {
+            with_app(|a| a.settings_moved());
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            with_app(|a| a.close_settings());
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCHITTEST => {

@@ -122,6 +122,8 @@ pub struct Gfx {
     pub fade: Cell<f32>,
     /// The (shift, scale, origin x) last set with `transform`, which `scale_at` builds on.
     base: Cell<(f32, f32, f32)>,
+    /// Where the notch's top is (dp down the window): every transform shifts down by it.
+    dy: Cell<f32>,
     /// When set, the next presented frame is also saved to this PNG.
     pub dump_to: Option<std::path::PathBuf>,
     /// Desktop frames whose captured content changed (the on-screen FPS counts these),
@@ -140,6 +142,8 @@ pub struct Gfx {
     icon_font: String,
     /// Inter, loaded from memory: (family name, its collection).
     display: Option<(String, IDWriteFontCollection1)>,
+    /// The KFGQPC Qur'an face's family name, in the same collection.
+    quran: Option<String>,
     /// The in-memory loader Inter was registered with; unregistered on drop, before the
     /// fonts that use it are gone (leaving it registered crashes DirectWrite at exit).
     font_loader: Option<IDWriteInMemoryFontFileLoader>,
@@ -165,9 +169,9 @@ impl Gfx {
             let icon_font = if fonts.join("SegoeIcons.ttf").exists() { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
             let brush = rt.CreateSolidColorBrush(&color(WHITE), None)?;
             let ctx = d3d.GetImmediateContext()?;
-            let (display, font_loader) = match try_load_inter(&dwrite) {
-                Ok((name, coll, loader)) => (Some((name, coll)), Some(loader)),
-                Err(_) => (None, None),
+            let (display, quran, font_loader) = match try_load_inter(&dwrite) {
+                Ok((name, quran, coll, loader)) => (Some((name, coll)), quran, Some(loader)),
+                Err(_) => (None, None, None),
             };
             let tabular = dwrite.CreateTypography().ok().filter(|t| {
                 let tnum = DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 };
@@ -190,6 +194,7 @@ impl Gfx {
                 generation: 0,
                 fade: Cell::new(1.0),
                 base: Cell::new((0.0, 1.0, 0.0)),
+                dy: Cell::new(0.0),
                 dump_to: None,
                 screen_frames: 0,
                 last_full: std::time::Instant::now(),
@@ -199,6 +204,7 @@ impl Gfx {
                 font: font.into(),
                 icon_font: icon_font.into(),
                 display,
+                quran,
                 font_loader,
                 tabular,
                 formats: RefCell::new(HashMap::new()),
@@ -324,6 +330,7 @@ impl Gfx {
             self.rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
         }
         self.fade.set(1.0);
+        self.dy.set(0.0);
         self.offset(0.0);
         Ok(())
     }
@@ -333,11 +340,19 @@ impl Gfx {
         self.transform(dx, 1.0, 0.0);
     }
 
+    /// Moves what's drawn from here on down by `dy` dp (to where the notch's top is, when
+    /// it isn't at the window's top), under every other transform.
+    pub fn set_dy(&self, dy: f32) {
+        self.dy.set(dy);
+        let (dx, k, ox) = self.base.get();
+        self.transform(dx, k, ox);
+    }
+
     /// Rotates everything drawn after this call by `deg` (clockwise) around (`cx`, `cy`),
     /// then shifts it right by `dx`.
     pub fn rotate(&self, dx: f32, cx: f32, cy: f32, deg: f32) {
         let (s, c) = deg.to_radians().sin_cos();
-        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - c * cx + s * cy + dx, M32: cy - s * cx - c * cy };
+        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - c * cx + s * cy + dx, M32: cy - s * cx - c * cy + self.dy.get() };
         unsafe { self.rt.SetTransform(&m) };
     }
 
@@ -345,7 +360,7 @@ impl Gfx {
     /// `transform`. Undo with `unscale`.
     pub fn scale_at(&self, cx: f32, cy: f32, k: f32) {
         let (dx, bk, ox) = self.base.get();
-        let m = Matrix3x2 { M11: k * bk, M12: 0.0, M21: 0.0, M22: k * bk, M31: bk * (cx - k * cx + dx - ox) + ox, M32: bk * (cy - k * cy) };
+        let m = Matrix3x2 { M11: k * bk, M12: 0.0, M21: 0.0, M22: k * bk, M31: bk * (cx - k * cx + dx - ox) + ox, M32: bk * (cy - k * cy) + self.dy.get() };
         unsafe { self.rt.SetTransform(&m) };
     }
 
@@ -366,7 +381,7 @@ impl Gfx {
     /// top edge together with the notch.
     pub fn transform(&self, dx: f32, k: f32, origin_x: f32) {
         self.base.set((dx, k, origin_x));
-        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: k * (dx - origin_x) + origin_x, M32: 0.0 };
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: k * (dx - origin_x) + origin_x, M32: self.dy.get() };
         unsafe { self.rt.SetTransform(&m) };
     }
 
@@ -872,6 +887,59 @@ impl Gfx {
 
     /// The notch: a black slab hanging from the top edge, centered on `cx`, with rounded
     /// bottom corners (radius `r`) and concave "ears" (radius `e`) flaring into the top edge.
+    /// A free-standing shape (the notch moved off the top edge, or standing on a side
+    /// edge): a rectangle with its own radius at each corner (top-left, top-right,
+    /// bottom-right, bottom-left), in black or in glass.
+    pub fn slab(&self, b: Rect, radii: [f32; 4], c: Color) {
+        if let Some(geo) = self.slab_geo(b, radii) {
+            unsafe { self.rt.FillGeometry(&geo, self.solid(c), None) };
+        }
+    }
+
+    pub fn glass_slab(&self, b: Rect, radii: [f32; 4]) {
+        let Some(geo) = self.slab_geo(b, radii) else { return };
+        let k = 1.0 + 0.05 * (b.h.min(b.w) / 140.0).min(1.0);
+        self.glass_fill(&geo.into(), b, (b.x + b.w / 2.0, b.y + b.h / 2.0, k));
+        if b.h > 40.0 && b.w > 40.0 {
+            if let Some(inner) = self.slab_geo(b.grow(-2.0), radii.map(|r| (r - 2.0).max(0.0))) {
+                self.stroke_geo_gradient(&inner.into(), b, 2.0, &[(0.0, white(0.06)), (0.5, white(0.0)), (1.0, white(0.09))]);
+            }
+        }
+    }
+
+    fn slab_geo(&self, b: Rect, radii: [f32; 4]) -> Option<ID2D1PathGeometry> {
+        let max = (b.w / 2.0).min(b.h / 2.0).max(0.0);
+        let [tl, tr, br, bl] = radii.map(|r| r.clamp(0.0, max));
+        let (l, t, r, btm) = (b.x, b.y, b.x + b.w, b.y + b.h);
+        let arc = |p: D2D_POINT_2F, rad: f32| D2D1_ARC_SEGMENT {
+            point: p,
+            size: D2D_SIZE_F { width: rad, height: rad },
+            rotationAngle: 0.0,
+            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            arcSize: D2D1_ARC_SIZE_SMALL,
+        };
+        self.path(|s| unsafe {
+            s.BeginFigure(pt(l + tl, t), D2D1_FIGURE_BEGIN_FILLED);
+            s.AddLine(pt(r - tr, t));
+            if tr > 0.0 {
+                s.AddArc(&arc(pt(r, t + tr), tr));
+            }
+            s.AddLine(pt(r, btm - br));
+            if br > 0.0 {
+                s.AddArc(&arc(pt(r - br, btm), br));
+            }
+            s.AddLine(pt(l + bl, btm));
+            if bl > 0.0 {
+                s.AddArc(&arc(pt(l, btm - bl), bl));
+            }
+            s.AddLine(pt(l, t + tl));
+            if tl > 0.0 {
+                s.AddArc(&arc(pt(l + tl, t), tl));
+            }
+            s.EndFigure(D2D1_FIGURE_END_CLOSED);
+        })
+    }
+
     pub fn notch(&self, cx: f32, w: f32, h: f32, r: f32, e: f32, c: Color) {
         if let Some(geo) = self.notch_geo(cx, w, h, r, e) {
             unsafe { self.rt.FillGeometry(&geo, self.solid(c), None) };
@@ -996,6 +1064,7 @@ impl Gfx {
         let (family, collection): (&str, Option<IDWriteFontCollection>) = match (face, &self.display) {
             (Face::Icon, _) => (&self.icon_font, None),
             (Face::Display, Some((name, coll))) => (name, coll.cast().ok()),
+            (Face::Quran, Some((_, coll))) if self.quran.is_some() => (self.quran.as_deref().unwrap_or_default(), coll.cast().ok()),
             _ => (&self.font, None),
         };
         let f = unsafe {
@@ -1093,6 +1162,57 @@ impl Gfx {
         }
     }
 
+    /// Arabic text in the Qur'an face, wrapped right to left and centered, lines 1.6 apart.
+    fn quran_layout(&self, s: &str, w: f32, size: f32, spans: &[Span]) -> Option<IDWriteTextLayout> {
+        let l = self.layout(s, size, 400, w, Align::Center, Face::Quran)?;
+        let line = size * 1.6;
+        unsafe {
+            let _ = l.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            let _ = l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            let _ = l.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.72);
+            let _ = l.SetMaxHeight(4000.0);
+            let mut system = None;
+            let _ = self.dwrite.GetSystemFontCollection(&mut system, false);
+            for sp in spans {
+                let range = DWRITE_TEXT_RANGE { startPosition: sp.start, length: sp.len };
+                if let Some(k) = sp.ui_font {
+                    let _ = l.SetFontCollection(system.as_ref(), range);
+                    let _ = l.SetFontFamilyName(&HSTRING::from(self.font.as_str()), range);
+                    let _ = l.SetFontSize(size * k, range);
+                }
+            }
+        }
+        Some(l)
+    }
+
+    /// How tall `quran_text` is at a size, in a box `w` wide.
+    pub fn quran_height(&self, s: &str, w: f32, size: f32, spans: &[Span]) -> f32 {
+        let Some(l) = self.quran_layout(s, w, size, spans) else { return 0.0 };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let _ = l.GetMetrics(&mut m);
+        }
+        m.height
+    }
+
+    /// Draws Arabic text in the Qur'an face, wrapped and centered in `b` (both ways), with
+    /// its spans in their own colors.
+    pub fn quran_text(&self, s: &str, b: Rect, size: f32, c: Color, spans: &[Span]) {
+        let Some(l) = self.quran_layout(s, b.w, size, spans) else { return };
+        unsafe {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            for sp in spans {
+                let k = [sp.color[0], sp.color[1], sp.color[2], sp.color[3] * self.fade.get()];
+                if let Ok(brush) = self.rt.CreateSolidColorBrush(&color(k), None) {
+                    let _ = l.SetDrawingEffect(&brush, DWRITE_TEXT_RANGE { startPosition: sp.start, length: sp.len });
+                }
+            }
+            let y = b.y + ((b.h - m.height) / 2.0).max(0.0);
+            self.rt.DrawTextLayout(pt(b.x, y), &l, self.solid(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
     pub fn measure(&self, s: &str, size: f32, weight: u32) -> f32 {
         self.measure_face(s, size, weight, Face::Text)
     }
@@ -1129,15 +1249,31 @@ enum Face {
     Text,
     Icon,
     Display,
+    Quran,
+}
+
+/// Part of a text drawn differently: its range (UTF-16 units), color, and, for marks the
+/// Qur'an face draws as ornaments when they shouldn't be, the UI font at a smaller size.
+pub struct Span {
+    pub start: u32,
+    pub len: u32,
+    pub color: Color,
+    pub ui_font: Option<f32>,
 }
 
 /// Inter (SIL Open Font License, see assets/fonts/Inter-LICENSE.txt), shipped inside the
 /// exe and loaded from memory: nothing is installed on the system.
 const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 
-/// Loads Inter from memory. Returns the family name to ask for, the collection holding
-/// it, and the loader (which must be unregistered before the factory goes away).
-unsafe fn try_load_inter(dwrite: &IDWriteFactory) -> std::result::Result<(String, IDWriteFontCollection1, IDWriteInMemoryFontFileLoader), String> {
+/// The King Fahd Complex's Hafs Qur'an font, unmodified (its license is
+/// assets/fonts/KFGQPC-LICENSE.txt), for the reminders' verses, dhikr and du'a.
+const KFGQPC: &[u8] = include_bytes!("../assets/fonts/KFGQPC-Hafs-V30.ttf");
+
+/// Loads Inter and the Qur'an face from memory. Returns Inter's family name to ask for, the
+/// Qur'an face's, the collection holding both, and the loader (which must be unregistered
+/// before the factory goes away).
+#[allow(clippy::type_complexity)]
+unsafe fn try_load_inter(dwrite: &IDWriteFactory) -> std::result::Result<(String, Option<String>, IDWriteFontCollection1, IDWriteInMemoryFontFileLoader), String> {
     let step = |what: &str, e: windows::core::Error| format!("{what}: {e}");
     let f5: IDWriteFactory5 = dwrite.cast().map_err(|e| step("IDWriteFactory5", e))?;
     let loader = f5.CreateInMemoryFontFileLoader().map_err(|e| step("loader", e))?;
@@ -1147,6 +1283,9 @@ unsafe fn try_load_inter(dwrite: &IDWriteFactory) -> std::result::Result<(String
         .map_err(|e| step("font file", e))?;
     let builder = f5.CreateFontSetBuilder().map_err(|e| step("set builder", e))?;
     builder.AddFontFile(&file).map_err(|e| step("add file", e))?;
+    if let Ok(quran) = loader.CreateInMemoryFontFileReference(&f5, KFGQPC.as_ptr() as _, KFGQPC.len() as u32, None) {
+        let _ = builder.AddFontFile(&quran);
+    }
     let set = builder.CreateFontSet().map_err(|e| step("font set", e))?;
     let coll = f5.CreateFontCollectionFromFontSet(&set).map_err(|e| step("collection", e))?;
     let mut names = Vec::new();
@@ -1161,8 +1300,9 @@ unsafe fn try_load_inter(dwrite: &IDWriteFactory) -> std::result::Result<(String
     }
     // The variable font shows up as "… Text" and "… Display" families (its optical sizes);
     // the display cut is drawn for large type like the clock, as SF Display is on iOS.
-    let pick = names.iter().find(|n| n.contains("Display")).or(names.first()).cloned();
-    pick.map(|n| (n, coll.clone(), loader.clone())).ok_or_else(|| format!("no families in the collection ({names:?})"))
+    let quran = names.iter().find(|n| n.contains("KFGQPC") || n.contains("HAFS")).cloned();
+    let pick = names.iter().find(|n| n.contains("Display")).or(names.iter().find(|n| n.contains("Inter"))).cloned();
+    pick.map(|n| (n, quran, coll.clone(), loader.clone())).ok_or_else(|| format!("no families in the collection ({names:?})"))
 }
 
 #[cfg(test)]
@@ -1174,7 +1314,10 @@ mod tests {
         unsafe {
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
             match try_load_inter(&dw) {
-                Ok((name, _, _)) => println!("loaded family {name:?}"),
+                Ok((name, quran, _, _)) => {
+                    println!("loaded family {name:?}, Qur'an face {quran:?}");
+                    assert!(quran.is_some(), "the Qur'an face didn't load");
+                }
                 Err(e) => panic!("Inter didn't load: {e}"),
             }
         }

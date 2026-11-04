@@ -124,6 +124,10 @@ pub struct Gfx {
     base: Cell<(f32, f32, f32)>,
     /// Where the notch's top is (dp down the window): every transform shifts down by it.
     dy: Cell<f32>,
+    /// A theme's tint over the glass (top, bottom), in place of the usual dark one.
+    pub tint: Cell<Option<(Color, Color)>>,
+    /// A theme's text color: near-white colors drawn on the notch take it instead.
+    pub ink: Cell<Option<Color>>,
     /// When set, the next presented frame is also saved to this PNG.
     pub dump_to: Option<std::path::PathBuf>,
     /// Desktop frames whose captured content changed (the on-screen FPS counts these),
@@ -195,6 +199,8 @@ impl Gfx {
                 fade: Cell::new(1.0),
                 base: Cell::new((0.0, 1.0, 0.0)),
                 dy: Cell::new(0.0),
+                tint: Cell::new(None),
+                ink: Cell::new(None),
                 dump_to: None,
                 screen_frames: 0,
                 last_full: std::time::Instant::now(),
@@ -635,7 +641,8 @@ impl Gfx {
                         self.rt.FillGeometry(geo, &brush, None);
                     }
                 }
-                self.fill_geo_gradient(geo, bounds, &[(0.0, [0.02, 0.02, 0.04, 0.58]), (1.0, [0.02, 0.02, 0.05, 0.72])], true);
+                let (top, bottom) = self.tint.get().unwrap_or(([0.02, 0.02, 0.04, 0.58], [0.02, 0.02, 0.05, 0.72]));
+                self.fill_geo_gradient(geo, bounds, &[(0.0, top), (1.0, bottom)], true);
             } else {
                 self.fill_geo_gradient(geo, bounds, &[(0.0, [0.05, 0.05, 0.07, 0.90]), (1.0, [0.02, 0.02, 0.03, 0.94])], true);
             }
@@ -728,6 +735,11 @@ impl Gfx {
     }
 
     fn solid(&self, c: Color) -> &ID2D1SolidColorBrush {
+        // (On the notch, with a theme's own text color, white becomes it.)
+        let c = match self.ink.get().filter(|_| self.current == MAIN && c[0] > 0.85 && c[1] > 0.85 && c[2] > 0.85) {
+            Some(ink) => [ink[0], ink[1], ink[2], c[3]],
+            None => c,
+        };
         let c = [c[0], c[1], c[2], c[3] * self.fade.get()];
         unsafe { self.brush.SetColor(&color(c)) };
         &self.brush
@@ -887,6 +899,53 @@ impl Gfx {
 
     /// The notch: a black slab hanging from the top edge, centered on `cx`, with rounded
     /// bottom corners (radius `r`) and concave "ears" (radius `e`) flaring into the top edge.
+    /// The notch (or a free-standing shape: `radii`) in a theme's own colors: its glass tint,
+    /// or its surface with color spots, dots and a strip along the bottom; then its outline.
+    pub fn themed(&self, notch: (f32, f32, f32, f32, f32), slab: Option<(Rect, [f32; 4])>, t: &crate::themes::Theme, glass_on: bool) {
+        let (cx, w, h, r, e) = notch;
+        let (geo, bounds) = match slab {
+            Some((b, radii)) => (self.slab_geo(b, radii), b),
+            None => (self.notch_geo(cx, w, h, r, e), Rect::new(cx - w / 2.0, 0.0, w, h)),
+        };
+        let Some(geo) = geo else { return };
+        let geo: ID2D1Geometry = geo.into();
+        match t.glass {
+            Some(tint) if glass_on => {
+                self.tint.set(Some(tint));
+                self.glass_fill(&geo, bounds, (bounds.x + bounds.w / 2.0, bounds.y, 1.0 + 0.05 * (bounds.h / 140.0).min(1.0)));
+                self.tint.set(None);
+            }
+            _ => unsafe {
+                let surface = if t.glass.is_some() { (t.glass.unwrap().0, t.glass.unwrap().1) } else { t.bg };
+                let opaque = |c: Color| [c[0], c[1], c[2], if t.glass.is_some() { 0.96 } else { c[3] }];
+                self.fill_geo_gradient(&geo, bounds, &[(0.0, opaque(surface.0)), (1.0, opaque(surface.1))], true);
+                let params = D2D1_LAYER_PARAMETERS1 {
+                    contentBounds: D2D_RECT_F { left: -1e6, top: -1e6, right: 1e6, bottom: 1e6 },
+                    geometricMask: std::mem::ManuallyDrop::new(Some(geo.clone())),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 },
+                    opacity: 1.0,
+                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                };
+                self.rt.PushLayer(&params, None);
+                for b in &t.blobs {
+                    self.radial(bounds.x + b.x * bounds.w, bounds.y + b.y * bounds.h, b.rx * bounds.w, b.ry * bounds.h, b.c);
+                }
+                for &(x, y, rad, c) in &t.dots {
+                    self.fill_circle(bounds.x + x * bounds.w, bounds.y + y * bounds.h, rad, c);
+                }
+                if let Some((gh, c)) = t.ground {
+                    self.fill_rrect(Rect::new(bounds.x, bounds.y + bounds.h - gh, bounds.w, gh), 0.0, c);
+                }
+                self.rt.PopLayer();
+            },
+        }
+        if t.line.1 > 0.0 {
+            unsafe { self.rt.DrawGeometry(&geo, self.solid(t.line.0), t.line.1, None) };
+        }
+    }
+
     /// A free-standing shape (the notch moved off the top edge, or standing on a side
     /// edge): a rectangle with its own radius at each corner (top-left, top-right,
     /// bottom-right, bottom-left), in black or in glass.

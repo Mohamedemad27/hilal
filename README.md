@@ -33,8 +33,8 @@ line, or a running focus timer. Reminders peek out on their own.
 | **Music** | What's playing in any app that reports to Windows' media controls (Spotify, browsers, players): cover, title, progress, play/pause/skip, and **synced lyrics** in a wide view. |
 | **Pomodoro** | Focus and short-break timers. |
 | **Water Reminder** | A daily goal split into reminders through your waking hours; tracks your bottle and refills, with snooze. |
-| **Prayer Times** | The five daily prayers for 33 Egyptian cities and 44 more around the world, or **wherever you are** (found from your internet address), worked out on the device with each country's own method (Egyptian Survey, Umm al-Qura, Dubai, Diyanet, ISNA and more) and shown in the place's own time zone, like a mosque timetable. The Hijri date (adjustable by a day or two for a local moon sighting), Asr by the Hanafi rule if you like, a countdown to the next prayer, a short heads-up 10 minutes before, and an alert at each prayer that can play an **adhan recording of your choice**. |
-| **Video Download** | Paste a link, pick **MP3** or **MP4**, download (YouTube and the many other sites yt-dlp supports). |
+| **Prayer Times** | The five daily prayers for 33 Egyptian cities and 44 more around the world, or **wherever you are** (found from your internet address), worked out on the device with each country's own method (Egyptian Survey, Umm al-Qura, Dubai, Diyanet, ISNA and more) and shown in the place's own time zone, like a mosque timetable. The Hijri date (adjustable by a day or two for a local moon sighting), Asr by the Hanafi rule if you like, a countdown to the next prayer, a short heads-up 10 minutes before, a Ramadan countdown to iftar and imsak, and an alert at each prayer that can play an **adhan recording of your choice**. |
+| **Video Download** | Paste a link, pick **MP3** or **MP4**, download (YouTube and the many other sites yt-dlp supports). Before it starts, a small window lets you choose video or sound only, the format (MP4, MKV, WEBM, MP3, M4A, OPUS, WAV) and the quality (only what the video has), rename the file, and set the artist and album written into it. |
 | **Claude Code** | Your recent [Claude Code](https://claude.com/claude-code) sessions: which are working, waiting for you, done or stopped, and their task progress. Click one for a glass popup with its tasks and latest exchange, and a box to send it a message (pasted into the Claude app, for you to send). |
 | **Shelf** | Drop files onto the notch to keep them at hand; drag them back out. |
 | **Todo** | A short task list with times. |
@@ -64,6 +64,28 @@ minimal notch, FPS overlay, the dhikr and Qur'an reminders (on or off, how often
 which kinds, quiet hours, show one now), vertical mode and reset position, behavior over
 maximized windows and in full screen, the Hijri date adjustment, Asr by the Hanafi rule, and the
 adhan sound.
+
+**Classic or Nova.** Settings has a Style switch: **Classic Hilal** is Hilal as it was, and
+**Nova** turns on everything that follows [Nova Island](https://github.com/NOVA-TECH-KIT/nova-island).
+Nova's own settings stay saved either way. In Nova mode:
+
+- **Prayer:** other countries' methods, Auto location, the Hijri date, Ramadan (iftar and
+  imsak), Hanafi Asr, and the adhan as a scene with the mascot.
+- **The notch:** drag it anywhere, stand it on a side edge, or let it sit in Chrome, Edge or
+  Brave's address bar; a closed notch that turns between the clock and weather, CPU and memory,
+  the next prayer and the next meeting; a card for each new song; 13 themes; Ctrl+Alt+H pins it
+  open.
+- **Toasts:** volume, brightness, battery, keyboard language, Caps Lock, the internet, apps
+  using the mic or camera (with a dot on the notch), copied screenshots (saved and put on the
+  Shelf for a while), browser downloads, and a smart clipboard for links, colors and sums.
+- **Pages:** Apps (pinned apps to start or bring to the front), Quran Radio (live stations from
+  mp3quran.net), and Clipboard (the connection, who's using the mic and camera, and what you
+  copied, kept in memory only). Any page can be switched off.
+- **Meetings** from a private iCal link (Google, Outlook, iCloud): a toast before each, and Join.
+- **Companion:** Welcome back, a morning card, a break after 50 minutes, confetti, and eyes on
+  the notch.
+- **Dhikr, du'a and Qur'an** cards, a YouTube mini player, performance options (no animations,
+  frozen glass, battery saver), auto-update, and news from Hilal's GitHub page.
 
 ## Install
 
@@ -134,8 +156,11 @@ Hilal keeps everything on your PC, in `%APPDATA%\Hilal`. There's no account and 
 goes online only to fetch lyrics from [LRCLIB](https://lrclib.net) (the song's title, artist and
 length), for downloads you start yourself, and, only if you pick **Auto** as the prayer city, once
 a day to find your city from your internet address ([ipwho.is](https://ipwho.is), or if it's busy
-[GeoJS](https://www.geojs.io) or [ipapi](https://ipapi.co)). The Claude Code page only reads the
-session files Claude Code keeps on your PC.
+[GeoJS](https://www.geojs.io) or [ipapi](https://ipapi.co)). In Nova mode it also reads the weather
+from [Open-Meteo](https://open-meteo.com), Quran Radio's stations from
+[mp3quran.net](https://mp3quran.net), your iCal link if you give one, and Hilal's own GitHub page
+(for updates and news); nothing is sent about you. The Claude Code page only reads the session
+files Claude Code keeps on your PC.
 
 ## Credits
 

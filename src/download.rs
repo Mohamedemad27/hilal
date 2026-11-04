@@ -23,6 +23,78 @@ pub enum Kind {
     Mp4,
 }
 
+/// What to save (chosen before the download): the sound only or the video, in which
+/// format, at what quality (a video's height, a sound's bitrate; None: the best there is),
+/// and optionally the file's name and the artist and album written into it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Options {
+    pub audio: bool,
+    pub format: &'static str,
+    pub quality: Option<u32>,
+    pub name: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+pub const VIDEO_FORMATS: [&str; 3] = ["mp4", "mkv", "webm"];
+pub const AUDIO_FORMATS: [&str; 4] = ["mp3", "m4a", "opus", "wav"];
+/// Video heights to offer (those the video has), and sound bitrates (kbps).
+pub const HEIGHTS: [u32; 7] = [2160, 1440, 1080, 720, 480, 360, 240];
+pub const BITRATES: [u32; 3] = [320, 192, 128];
+
+impl Options {
+    /// The plain choice of the page's MP3 and MP4 buttons: the best there is.
+    pub fn of(kind: Kind) -> Self {
+        Self { audio: kind == Kind::Mp3, format: if kind == Kind::Mp3 { "mp3" } else { "mp4" }, quality: None, name: None, artist: None, album: None }
+    }
+}
+
+/// What a link holds, read before downloading: the title, the artist and album (as the site
+/// gives them, else the uploader), and the video heights there are.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Info {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub heights: Vec<u32>,
+}
+
+/// Reads what a link holds, in the background (yt-dlp's JSON, nothing downloaded).
+pub fn probe(url: &str) -> std::sync::mpsc::Receiver<Option<Info>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = url.to_owned();
+    std::thread::spawn(move || {
+        let out = Command::new(tools_dir().join("yt-dlp.exe"))
+            .args(["-J", "--no-playlist", "--no-warnings", "--js-runtimes", "node", "--", &url])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .env("PYTHONIOENCODING", "utf-8")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let info = out.ok().filter(|o| o.status.success()).and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()).map(|j| info_of(&j));
+        let _ = tx.send(info);
+    });
+    rx
+}
+
+fn info_of(j: &serde_json::Value) -> Info {
+    let s = |k: &str| j[k].as_str().unwrap_or("").trim().to_owned();
+    let mut heights: Vec<u32> = j["formats"]
+        .as_array()
+        .map(|f| f.iter().filter(|f| f["vcodec"].as_str().is_some_and(|v| v != "none")).filter_map(|f| f["height"].as_u64().map(|h| h as u32)).collect())
+        .unwrap_or_default();
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    let artist = [s("artist"), s("creator"), s("uploader"), s("channel")].into_iter().find(|a| !a.is_empty()).unwrap_or_default();
+    Info { title: s("title"), artist, album: s("album"), heights }
+}
+
+/// A name Windows takes for a file (no \ / : * ? " < > |, no dots or spaces at the end).
+pub fn file_name(name: &str) -> String {
+    let clean: String = name.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
+    clean.trim().trim_end_matches(['.', ' ']).chars().take(150).collect()
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum Phase {
     Starting,
@@ -109,8 +181,8 @@ pub fn clipboard_link() -> Option<String> {
     }
 }
 
-/// The yt-dlp arguments for a kind of download.
-fn args(kind: Kind, url: &str, out: &std::path::Path) -> Vec<String> {
+/// The yt-dlp arguments for a download.
+fn args(o: &Options, url: &str, out: &std::path::Path) -> Vec<String> {
     let mut a: Vec<String> = [
         "--newline",
         "--no-playlist",
@@ -133,12 +205,33 @@ fn args(kind: Kind, url: &str, out: &std::path::Path) -> Vec<String> {
     .to_vec();
     a.push(tools_dir().display().to_string());
     a.push("-o".into());
-    a.push(out.join("%(title).150B.%(ext)s").display().to_string());
-    match kind {
-        Kind::Mp3 => a.extend(["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"].map(String::from)),
-        Kind::Mp4 => a.extend(
-            ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b", "--merge-output-format", "mp4"].map(String::from),
-        ),
+    let name = o.name.as_deref().map(file_name).filter(|n| !n.is_empty());
+    // (A % in a chosen name is meant as itself, not as a field.)
+    let pattern = name.map_or_else(|| "%(title).150B".to_owned(), |n| n.replace('%', "%%"));
+    a.push(out.join(format!("{pattern}.%(ext)s")).display().to_string());
+    if o.audio {
+        let q = match o.quality {
+            Some(k) => format!("{k}K"),
+            None => "0".to_owned(),
+        };
+        a.extend(["-f", "bestaudio/best", "-x", "--audio-format", o.format, "--audio-quality", &q].map(String::from));
+    } else {
+        let h = o.quality.map_or(String::new(), |h| format!("[height<={h}]"));
+        let f = match o.format {
+            "mp4" => format!("bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/bv*{h}+ba/b{h}"),
+            "webm" => format!("bv*{h}[ext=webm]+ba[ext=webm]/bv*{h}+ba/b{h}"),
+            _ => format!("bv*{h}+ba/b{h}"),
+        };
+        a.extend(["-f".to_owned(), f, "--merge-output-format".to_owned(), o.format.to_owned()]);
+    }
+    // The tags: the title, and the artist and album as given (yt-dlp's own guesses when not).
+    a.push("--embed-metadata".into());
+    for (field, v) in [("meta_artist", &o.artist), ("meta_album", &o.album)] {
+        if let Some(v) = v.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            // (A colon would split the instruction; the full-width one looks the same.)
+            a.push("--parse-metadata".into());
+            a.push(format!("{}:%({field})s", v.replace(':', "\u{ff1a}").replace('%', "%%")));
+        }
     }
     a.push("--".into());
     a.push(url.to_owned());
@@ -159,8 +252,14 @@ fn read_line(line: &str, s: &mut Status) {
     }
 }
 
-/// Starts downloading `url` as `kind`.
+/// Starts downloading `url` as `kind` (the best there is).
+#[allow(dead_code)]
 pub fn start(url: &str, kind: Kind) -> Job {
+    start_with(url, &Options::of(kind))
+}
+
+/// Starts downloading `url` with the options chosen.
+pub fn start_with(url: &str, opts: &Options) -> Job {
     let status = Arc::new(Mutex::new(Status { title: String::new(), progress: 0.0, phase: Phase::Starting }));
     let child_slot = Arc::new(Mutex::new(None));
     let job = Job { status: status.clone(), child: child_slot.clone() };
@@ -175,7 +274,7 @@ pub fn start(url: &str, kind: Kind) -> Job {
         return job;
     }
     let spawned = Command::new(tools_dir().join("yt-dlp.exe"))
-        .args(args(kind, url, &out))
+        .args(args(opts, url, &out))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -273,10 +372,24 @@ mod tests {
 
     #[test]
     fn mp3_asks_for_audio_and_mp4_for_merged_video() {
-        let a = args(Kind::Mp3, "https://x", std::path::Path::new("D"));
+        let a = args(&Options::of(Kind::Mp3), "https://x", std::path::Path::new("D"));
         assert!(a.windows(2).any(|w| w == ["--audio-format", "mp3"]));
-        let v = args(Kind::Mp4, "https://x", std::path::Path::new("D"));
+        let v = args(&Options::of(Kind::Mp4), "https://x", std::path::Path::new("D"));
         assert!(v.windows(2).any(|w| w == ["--merge-output-format", "mp4"]));
         assert_eq!(v.last().unwrap(), "https://x");
+    }
+
+    #[test]
+    fn options_set_quality_format_name_and_tags() {
+        let o = Options { audio: false, format: "webm", quality: Some(720), name: Some("My: clip?".into()), artist: Some("A: B".into()), album: None };
+        let a = args(&o, "https://x", std::path::Path::new("D"));
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1].starts_with("bv*[height<=720][ext=webm]")), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["--merge-output-format", "webm"]));
+        assert!(a.iter().any(|x| x.ends_with("My_ clip_.%(ext)s")), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "--parse-metadata" && w[1] == "A\u{ff1a} B:%(meta_artist)s"), "{a:?}");
+        let s = Options { audio: true, format: "opus", quality: Some(128), name: None, artist: None, album: None };
+        let a = args(&s, "https://x", std::path::Path::new("D"));
+        assert!(a.windows(2).any(|w| w == ["--audio-quality", "128K"]));
+        assert!(a.iter().any(|x| x.ends_with("%(title).150B.%(ext)s")));
     }
 }

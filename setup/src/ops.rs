@@ -67,6 +67,12 @@ pub fn installed_version() -> Option<String> {
 }
 
 /// Runs the install on a worker thread, reporting progress into `job`.
+/// The choices already made, for an update: start with Windows if it does, and a desktop
+/// shortcut if there is one.
+pub fn current_options() -> Options {
+    Options { start_with_windows: reg_get(RUN_KEY, "Hilal").is_some(), desktop_shortcut: desktop_link().is_some_and(|p| p.exists()) }
+}
+
 pub fn install(opts: Options, job: Shared) {
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {

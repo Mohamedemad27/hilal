@@ -236,3 +236,22 @@ pub fn set_start_with_windows(on: bool) {
         }
     }
 }
+
+/// Pictures (the user's), where screenshots are saved.
+pub fn known_folder_pictures() -> Option<std::path::PathBuf> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, HANDLE::default()) }.ok()?;
+    unsafe { p.to_string() }.ok().map(std::path::PathBuf::from)
+}
+
+/// Opens a web link in the default browser.
+pub fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if url.starts_with("https://") || url.starts_with("http://") {
+        unsafe {
+            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
+        }
+    }
+}

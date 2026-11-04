@@ -4,16 +4,26 @@ mod gfx;
 mod lyrics;
 mod media;
 mod meter;
+mod mini;
 mod claude;
 mod claude_app;
+mod addrbar;
+mod apps;
+mod calendar;
 mod download;
+mod news;
 mod prayer;
+mod radio;
 mod reminders_data;
 mod shell;
 mod sound;
 mod store;
 mod sysmon;
+mod themes;
 mod ui;
+mod updater;
+mod watch;
+mod weather;
 mod win;
 
 use std::cell::RefCell;
@@ -33,7 +43,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use ui::{App, OV_W, SW_H, SW_W, WAKE_H, WIN_H, WIN_W};
+use ui::{App, DW_H, DW_W, OV_W, SW_H, SW_W, WAKE_H, WIN_H, WIN_W};
 
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted by the mouse hook when the cursor nears the notch; it only wakes the loop.
@@ -277,17 +287,14 @@ fn main() -> Result<()> {
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         start_mouse_hook();
         DragAcceptFiles(hwnd, true);
+        // Copies come to the notch (Nova mode's screenshot and smart clipboard toasts).
+        let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
         add_tray(hwnd);
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         with_app(|a| a.apply_position());
-        // Ctrl+Alt+H opens (or closes) the notch from anywhere.
-        {
-            use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT};
-            if RegisterHotKey(hwnd, HOTKEY_OPEN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H' as u32).is_err() {
-                ui::trace("[hotkey] Ctrl+Alt+H is taken by another app");
-            }
-        }
+        // Ctrl+Alt+H pins the notch open from anywhere (in Nova mode).
+        set_hotkey(with_app(|a| a.nova()).unwrap_or(true));
         with_app(|a| a.welcome(false));
         // HILAL_SETTINGS_TEST opens the Settings window at once (for testing).
         if std::env::var_os("HILAL_SETTINGS_TEST").is_some() {
@@ -434,6 +441,7 @@ fn tray_menu(hwnd: HWND) {
     let vertical = with_app(|a| a.vertical()).unwrap_or(false);
     let hijri = with_app(|a| a.hijri_adjust()).unwrap_or(0);
     let hanafi = with_app(|a| a.hanafi()).unwrap_or(false);
+    let nova = with_app(|a| a.nova()).unwrap_or(true);
     let overlay = with_app(|a| a.overlay_shown()).unwrap_or(false);
     let fullscreen = with_app(|a| a.hide_in_fullscreen()).unwrap_or(true);
     let start = win::starts_with_windows();
@@ -444,11 +452,13 @@ fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, check(start), MENU_START, w!("Start with Windows"));
         let _ = AppendMenuW(menu, check(glass), MENU_GLASS, w!("Liquid Glass"));
-        let _ = AppendMenuW(menu, check(share), MENU_SHARE, w!("Show in screen sharing"));
+        if nova {
+            let _ = AppendMenuW(menu, check(share), MENU_SHARE, w!("Show in screen sharing"));
+        }
         let _ = AppendMenuW(menu, check(minimal), MENU_MINIMAL, w!("Minimal notch"));
         let _ = AppendMenuW(menu, check(overlay), MENU_OVERLAY, w!("FPS overlay"));
         // Dhikr, du'a and Qur'an: on or off, how often, for how long, which kinds, quiet hours.
-        if let Ok(sub) = CreatePopupMenu() {
+        if let Some(sub) = CreatePopupMenu().ok().filter(|_| nova) {
             let _ = AppendMenuW(sub, check(rem.on), MENU_REM_ON, w!("On"));
             let _ = AppendMenuW(sub, MF_STRING, MENU_REM_NOW, w!("Show one now"));
             let _ = AppendMenuW(sub, MF_SEPARATOR, 0, None);
@@ -486,7 +496,7 @@ fn tray_menu(hwnd: HWND) {
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Dhikr & Qur'an reminders"));
         }
         // Where it is: drag it anywhere; or stand it on a side edge; or put it back.
-        if let Ok(sub) = CreatePopupMenu() {
+        if let Some(sub) = CreatePopupMenu().ok().filter(|_| nova) {
             let _ = AppendMenuW(sub, check(vertical), MENU_VERTICAL, w!("Vertical (dock left / right)"));
             let _ = AppendMenuW(sub, MF_STRING, MENU_RESET_POS, w!("Reset position"));
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Position"));
@@ -501,13 +511,15 @@ fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(fullscreen), MENU_FULLSCREEN, w!("Hide in full screen"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         // The Hijri date, moved a day or two for a local moon sighting.
-        if let Ok(sub) = CreatePopupMenu() {
+        if let Some(sub) = CreatePopupMenu().ok().filter(|_| nova) {
             for (k, name) in [w!("\u{2212}2 days"), w!("\u{2212}1 day"), w!("None"), w!("+1 day"), w!("+2 days")].into_iter().enumerate() {
                 let _ = AppendMenuW(sub, check(hijri == k as i32 - 2), MENU_HIJRI + k, name);
             }
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Hijri date adjustment"));
         }
-        let _ = AppendMenuW(menu, check(hanafi), MENU_HANAFI, w!("Asr by the Hanafi rule"));
+        if nova {
+            let _ = AppendMenuW(menu, check(hanafi), MENU_HANAFI, w!("Asr by the Hanafi rule"));
+        }
         let adhan = sound::adhan().is_some();
         let _ = AppendMenuW(menu, check(adhan), MENU_ADHAN, w!("Adhan sound\u{2026}"));
         if adhan {
@@ -647,6 +659,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
     let handled = match msg {
         WM_WAKE => Some(()),
+        0x031D /* WM_CLIPBOARDUPDATE */ => with_app(|a| a.clipboard_changed()),
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_OPEN => with_app(|a| a.hotkey()),
         WM_SETTINGCHANGE => {
             win::refresh_time_format();
@@ -672,6 +685,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONUP => {
             let (x, y) = dp(hwnd, lparam);
             with_app(|a| a.mouse_up(x, y))
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = dp(hwnd, lparam);
+            with_app(|a| a.mouse_right(x, y))
         }
         WM_MOUSEWHEEL => with_app(|a| a.wheel(((wparam.0 >> 16) & 0xffff) as i16 as i32)),
         WM_KEYDOWN => with_app(|a| a.key(wparam.0 as u16)),
@@ -713,6 +730,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // program) is gone makes Windows report a crash on exit.
             unsafe {
                 let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+            }
+            // An update downloaded but never accepted is installed as Hilal quits.
+            if let Some(path) = updater::PENDING.lock().ok().and_then(|mut p| p.take()) {
+                updater::install(&path, false);
             }
             let app = APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut a| a.take()));
             drop(app);
@@ -764,6 +785,122 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 }
 
 /// The Claude session popup: drag it by its header, close it with its button.
+/// Holds Ctrl+Alt+H for Hilal (Nova mode), or lets it go (Classic).
+pub fn set_hotkey(on: bool) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT};
+    let hwnd = HWND(NOTCH_HWND.load(Ordering::Relaxed) as _);
+    unsafe {
+        let _ = UnregisterHotKey(hwnd, HOTKEY_OPEN);
+        if on && RegisterHotKey(hwnd, HOTKEY_OPEN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H' as u32).is_err() {
+            ui::trace("[hotkey] Ctrl+Alt+H is taken by another app");
+        }
+    }
+}
+
+/// Creates the download options window (hidden; the app places, fills and shows it).
+pub fn create_dl_window() -> Option<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(dl_proc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).ok()?,
+            lpszClassName: w!("HilalDownload"),
+            ..Default::default()
+        };
+        RegisterClassExW(&class);
+        CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            w!("HilalDownload"),
+            w!("Hilal Download"),
+            WS_POPUP,
+            0,
+            0,
+            DW_W as i32,
+            DW_H as i32,
+            None,
+            None,
+            instance,
+            None,
+        )
+        .ok()
+    }
+}
+
+extern "system" fn dl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+    match msg {
+        WM_NCHITTEST => {
+            let mut p = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+            }
+            let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let drag = with_app(|a| a.dl_drags(p.x as f32 / scale, p.y as f32 / scale)).unwrap_or(false);
+            return LRESULT(if drag { HTCAPTION } else { HTCLIENT } as isize);
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = dp(hwnd, lparam);
+            let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            unsafe {
+                let _ = TrackMouseEvent(&mut track);
+            }
+            with_app(|a| a.dl_hover(x, y));
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            with_app(|a| a.dl_hover(-1.0, -1.0));
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = dp(hwnd, lparam);
+            with_app(|a| a.dl_down(x, y));
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = dp(hwnd, lparam);
+            // A drop-down's menu runs its own message loop: not while the app is borrowed.
+            if let Some(Some(ui::DlAfter::Menu(which))) = with_app(|a| a.dl_up(x, y)) {
+                let items = with_app(|a| a.dl_menu(which)).unwrap_or_default();
+                unsafe {
+                    if let Ok(menu) = CreatePopupMenu() {
+                        for (i, (label, on)) in items.iter().enumerate() {
+                            let flags = if *on { MF_STRING | MF_CHECKED } else { MF_STRING };
+                            let _ = AppendMenuW(menu, flags, i + 1, &HSTRING::from(label.as_str()));
+                        }
+                        let mut p = POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, p.x, p.y, 0, hwnd, None);
+                        let _ = DestroyMenu(menu);
+                        if cmd.0 > 0 {
+                            with_app(|a| a.dl_pick(which, cmd.0 as usize - 1));
+                        }
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wparam.0 as u32) {
+                with_app(|a| a.dl_char(c));
+            }
+            return LRESULT(0);
+        }
+        WM_EXITSIZEMOVE => {
+            with_app(|a| a.dl_moved());
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            with_app(|a| a.close_dl());
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 /// Creates the Settings window (hidden; the app sizes, fills and shows it).
 pub fn create_settings_window() -> Option<HWND> {
     unsafe {
@@ -798,7 +935,7 @@ pub fn create_settings_window() -> Option<HWND> {
 }
 
 extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
     const WM_MOUSELEAVE: u32 = 0x02A3;
     match msg {
         WM_NCHITTEST => {
@@ -845,8 +982,13 @@ extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             with_app(|a| a.settings_wheel(((wparam.0 >> 16) & 0xffff) as i16 as i32));
             return LRESULT(0);
         }
-        WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
-            with_app(|a| a.close_settings());
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wparam.0 as u32) {
+                let typed = with_app(|a| a.settings_char(c)).unwrap_or(false);
+                if !typed && c == '\u{1b}' {
+                    with_app(|a| a.close_settings());
+                }
+            }
             return LRESULT(0);
         }
         WM_EXITSIZEMOVE => {

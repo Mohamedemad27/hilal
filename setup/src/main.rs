@@ -5,6 +5,10 @@
 #[allow(dead_code)]
 #[path = "../../src/gfx.rs"]
 mod gfx;
+/// (The notch's themes, which the shared drawing code knows about.)
+#[path = "../../src/themes.rs"]
+#[allow(dead_code)]
+mod themes;
 mod ops;
 
 use std::cell::{Cell, RefCell};
@@ -65,6 +69,8 @@ struct Setup {
     delete_data: bool,
     installed: Option<String>,
     uninstall_mode: bool,
+    /// Updating: Hilal opens again by itself at the end.
+    update_mode: bool,
     job: Option<(ops::Shared, Instant)>,
     regions: RefCell<Vec<(Rect, Act)>>,
     /// Cursor in card coordinates (dp).
@@ -124,7 +130,19 @@ fn main() -> Result<()> {
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER);
         let gfx = Gfx::new(hwnd, WIN_W, WIN_H, scale, (x, y))?;
         let uninstall_mode = std::env::args().any(|a| a.eq_ignore_ascii_case("/uninstall"));
+        // `/update` (Hilal updating itself): installs at once with the choices already made,
+        // and opens Hilal again when done.
+        let update_mode = std::env::args().any(|a| a.eq_ignore_ascii_case("/update"));
         SETUP.with(|c| *c.borrow_mut() = Some(Setup::new(hwnd, gfx, uninstall_mode)));
+        if update_mode {
+            SETUP.with(|c| {
+                if let Some(s) = c.borrow_mut().as_mut() {
+                    s.update_mode = true;
+                    s.opts = ops::current_options();
+                    s.perform(Act::Install);
+                }
+            });
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
 
@@ -173,6 +191,7 @@ impl Setup {
             delete_data: false,
             installed,
             uninstall_mode,
+            update_mode: false,
             job: None,
             regions: RefCell::new(Vec::new()),
             cursor: (-1.0, -1.0),
@@ -199,6 +218,15 @@ impl Setup {
                     self.job = None;
                     self.installed = ops::installed_version();
                     self.go(if removing { Screen::Removed } else { Screen::Installed });
+                    if self.update_mode && !removing {
+                        // (`/nolaunch`: Hilal was quitting; it stays closed.)
+                        if std::env::args().any(|a| a.eq_ignore_ascii_case("/nolaunch")) {
+                            self.perform(Act::Close);
+                        } else {
+                            self.perform(Act::Launch);
+                        }
+                        return;
+                    }
                 }
                 Some(Err(e)) => {
                     let e = e.clone();

@@ -285,11 +285,14 @@ pub struct Settings {
     /// Standing on the left or right edge of the screen instead.
     pub vertical: bool,
     pub side_left: bool,
+    /// Nova Island's features on (its prayer methods, reminders, moving the notch, the
+    /// shortcut, ...); off, Hilal is as it was before them ("Classic").
+    pub nova: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true, shrink_over_maximized: true, hide_over_maximized: false, anchor: None, docked: true, vertical: false, side_left: false }
+        Self { minimal: false, glass: true, overlay: false, overlay_pos: None, hide_in_fullscreen: true, shrink_over_maximized: true, hide_over_maximized: false, anchor: None, docked: true, vertical: false, side_left: false, nova: true }
     }
 }
 
@@ -419,6 +422,113 @@ pub struct AutoPlace {
     pub day: u32,
 }
 
+/// Nova Island's switches for what its toasts and the System page show (Nova mode).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Features {
+    pub hud_volume: bool,
+    pub hud_brightness: bool,
+    pub battery: bool,
+    pub kbd_toast: bool,
+    pub caps_toast: bool,
+    pub net_toasts: bool,
+    pub privacy_dots: bool,
+    pub screenshot_toast: bool,
+    pub shot_auto_shelf: bool,
+    pub shot_shelf_minutes: u32,
+    pub smart_clipboard: bool,
+    pub clipboard_history: bool,
+    /// Pages switched off (by name: "music", "pomo", ...).
+    pub hidden_pages: Vec<String>,
+    /// The closed notch's slides, and a new song's card.
+    pub slide_clock: bool,
+    pub slide_stats: bool,
+    pub slide_prayer: bool,
+    pub track_peek: bool,
+    /// Upcoming meetings from a private iCal link (kept here only, never logged).
+    pub meetings: bool,
+    pub calendar_url: String,
+    /// Browser downloads seen in the Downloads folder, and their toasts.
+    pub folder_downloads: bool,
+    pub dl_toasts: bool,
+    /// The companion.
+    pub welcome_back: bool,
+    pub morning_brief: bool,
+    pub wellbeing: bool,
+    pub celebrate: bool,
+    pub nova_eyes: bool,
+    pub nova_prayer: bool,
+    pub nova_focus: bool,
+    /// The notch's theme ("original": Hilal's own look).
+    pub theme: String,
+    /// Performance: no animations, the glass refreshed only while open, and both (with the
+    /// glass off) on their own while the battery is low.
+    pub no_animations: bool,
+    pub glass_freeze: bool,
+    pub battery_saver: bool,
+    pub battery_saver_at: u32,
+    /// In a Chromium browser, the notch in the right third of its address bar.
+    pub addr_island: bool,
+    /// Updates from GitHub, and news from Hilal's repository.
+    pub auto_update: bool,
+    pub news: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            hud_volume: true,
+            hud_brightness: true,
+            battery: true,
+            kbd_toast: true,
+            caps_toast: true,
+            net_toasts: true,
+            privacy_dots: true,
+            screenshot_toast: true,
+            shot_auto_shelf: true,
+            shot_shelf_minutes: 20,
+            smart_clipboard: true,
+            clipboard_history: true,
+            hidden_pages: Vec::new(),
+            slide_clock: true,
+            slide_stats: true,
+            slide_prayer: true,
+            track_peek: true,
+            meetings: true,
+            calendar_url: String::new(),
+            folder_downloads: true,
+            dl_toasts: true,
+            welcome_back: true,
+            morning_brief: true,
+            wellbeing: true,
+            celebrate: true,
+            nova_eyes: true,
+            nova_prayer: true,
+            nova_focus: true,
+            theme: "original".to_owned(),
+            no_animations: false,
+            glass_freeze: false,
+            battery_saver: false,
+            battery_saver_at: 20,
+            addr_island: true,
+            auto_update: true,
+            news: true,
+        }
+    }
+}
+
+/// How long a screenshot stays on the Shelf by itself (Nova's steps, minutes).
+pub const SHOT_SHELF: [u32; 9] = [5, 10, 20, 30, 60, 120, 240, 480, 1440];
+
+fn radio_volume() -> f64 {
+    0.8
+}
+
+/// Seconds since 1970.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Store {
@@ -427,6 +537,25 @@ pub struct Store {
     pub reminders: Reminders,
     pub prayer: Prayer,
     pub shelf: Vec<PathBuf>,
+    /// Shelf files that leave by themselves (screenshots), and when (seconds since 1970).
+    pub shelf_until: Vec<(PathBuf, u64)>,
+    pub features: Features,
+    /// The Apps page's pinned apps (None: Nova's picks, once the Start menu is read), and the
+    /// Start menu's apps as last read.
+    pub apps_pinned: Option<Vec<crate::apps::AppEntry>>,
+    pub apps_catalog: Vec<crate::apps::AppEntry>,
+    /// Quran Radio: its stations as last read, the one chosen (its stream), and the volume.
+    pub radio_stations: Vec<crate::radio::Station>,
+    pub radio_station: Option<String>,
+    #[serde(default = "radio_volume")]
+    pub radio_volume: f64,
+    /// News already shown, and the day the last one came.
+    pub news_seen: Vec<String>,
+    pub news_day: u32,
+    /// The day (yyyymmdd) the morning card last came.
+    pub brief_day: u32,
+    /// The last weather, and when it came (seconds since 1970).
+    pub weather: Option<(crate::weather::Weather, u64)>,
     pub settings: Settings,
 }
 

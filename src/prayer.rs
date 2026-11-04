@@ -202,13 +202,13 @@ fn pc_zone() -> Option<String> {
 }
 
 /// Seconds since 1970 (UTC), now.
-fn utc_now() -> i64 {
+pub fn utc_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 /// The wall clock in `zone` at a moment (seconds since 1970, UTC): date, and seconds since
 /// that day's midnight. None if the zone isn't known.
-fn wall_clock(zone: &str, unix: i64) -> Option<(i32, u32, u32, i32)> {
+pub fn wall_clock(zone: &str, unix: i64) -> Option<(i32, u32, u32, i32)> {
     use windows::Foundation::DateTime;
     let cal = windows::Globalization::Calendar::new().ok()?;
     cal.ChangeClock(&HSTRING::from("24HourClock")).ok()?;
@@ -220,7 +220,7 @@ fn wall_clock(zone: &str, unix: i64) -> Option<(i32, u32, u32, i32)> {
 }
 
 /// Days since 1970 for a date.
-fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y } as i64;
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -232,7 +232,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 
 /// How many hours `zone`'s clocks run ahead of UTC around noon on a day (the PC's offset if
 /// the zone is empty or unknown).
-fn offset_on(zone: &str, y: i32, m: u32, d: u32) -> f64 {
+pub fn offset_on(zone: &str, y: i32, m: u32, d: u32) -> f64 {
     let noon = days_from_civil(y, m, d) * 86_400 + 12 * 3600;
     match (!zone.is_empty()).then(|| wall_clock(zone, noon)).flatten() {
         Some((wy, wm, wd, secs)) => {

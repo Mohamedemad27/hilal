@@ -22,6 +22,15 @@ use crate::prayer;
 use crate::reminders_data::REMINDERS;
 
 mod settings;
+mod apps_page;
+mod companion;
+mod dl_options;
+pub use dl_options::{After as DlAfter, DW_H, DW_W};
+mod extras;
+mod folder_downloads;
+mod meetings;
+mod slides;
+mod toasts;
 pub use settings::{After as SettingsAfter, SW_H, SW_W};
 use crate::store::{self, Store, Task};
 use crate::sysmon::{Snapshot, Sysmon};
@@ -66,6 +75,8 @@ const REMINDER_W: f32 = 500.0;
 const REMINDER_W_SIDE: f32 = 340.0;
 const REMINDER_MAX_H: f32 = 270.0;
 /// How long a prayer time stays in the notch if nobody dismisses it.
+/// Egypt's cities come first in `prayer::CITIES`.
+const EGYPT_CITIES: usize = 33;
 const PRAYER_SHOWN: Duration = Duration::from_secs(180);
 /// The heads-up before a prayer: how many minutes before, and how long it stays.
 const PRAYER_HEADSUP: i32 = 10;
@@ -101,6 +112,15 @@ const V_MINIMAL: Shape = Shape { w: 6.0, h: 120.0, r: 3.0, e: 0.0 };
 /// How long the welcome peek stays before closing.
 const WELCOME: Duration = Duration::from_millis(3400);
 
+/// Where the notch is placed (see `App::pos`).
+#[derive(Clone, Copy)]
+struct Pos {
+    anchor: Option<(i32, i32)>,
+    docked: bool,
+    vertical: bool,
+    side_left: bool,
+}
+
 /// A damped spring (unit mass), stepped with the real frame time. Unlike a fixed curve,
 /// it keeps its velocity when the target changes mid-flight, so quick hover in/out
 /// never jerks.
@@ -133,6 +153,11 @@ struct Anim {
 }
 
 impl Anim {
+    /// Straight to where it's going (with animations off).
+    fn snap(&mut self) {
+        self.s = [self.to.w, self.to.h, self.to.r, self.to.e].map(|x| Spring { x, v: 0.0 });
+    }
+
     fn new(at: Shape) -> Self {
         let s = [at.w, at.h, at.r, at.e].map(|x| Spring { x, v: 0.0 });
         Self { to: at, s, last: Instant::now() }
@@ -187,14 +212,57 @@ enum Page {
     Shelf,
     Todo,
     System,
+    /// Nova mode: the connection, who's using the mic and camera, and the clipboard history.
+    Clipboard,
+    /// Nova mode: pinned apps to start or bring to the front.
+    Apps,
+    /// Nova mode: live Qur'an stations.
+    Radio,
 }
 
+/// Classic Hilal's pages, in order.
 const PAGES: [Page; 9] =
     [Page::Music, Page::Pomo, Page::Water, Page::Prayer, Page::Download, Page::Claude, Page::Shelf, Page::Todo, Page::System];
+/// Nova mode's (each can be switched off).
+const NOVA_PAGES: [Page; 12] = [
+    Page::Music, Page::Apps, Page::Pomo, Page::Water, Page::Prayer, Page::Radio, Page::Download, Page::Claude, Page::Shelf, Page::Todo, Page::System, Page::Clipboard,
+];
 
 impl Page {
-    fn index(self) -> usize {
-        PAGES.iter().position(|p| *p == self).unwrap_or(0)
+    /// Its name, for the settings and the test pictures.
+    fn name(self) -> &'static str {
+        match self {
+            Page::Music => "music",
+            Page::Pomo => "pomo",
+            Page::Water => "water",
+            Page::Prayer => "prayer",
+            Page::Download => "download",
+            Page::Claude => "claude",
+            Page::Shelf => "shelf",
+            Page::Todo => "todo",
+            Page::System => "system",
+            Page::Clipboard => "clipboard",
+            Page::Apps => "apps",
+            Page::Radio => "radio",
+        }
+    }
+
+    /// What Settings calls it.
+    fn title(self) -> &'static str {
+        match self {
+            Page::Music => "Music",
+            Page::Pomo => "Pomodoro",
+            Page::Water => "Water",
+            Page::Prayer => "Prayer",
+            Page::Download => "Video Download",
+            Page::Claude => "Claude Code",
+            Page::Shelf => "Shelf",
+            Page::Todo => "Todo",
+            Page::System => "System",
+            Page::Clipboard => "Clipboard",
+            Page::Apps => "Apps",
+            Page::Radio => "Quran Radio",
+        }
     }
 }
 
@@ -220,6 +288,20 @@ enum Action {
     Bottle(i32),
     WaterSnooze,
     ReminderDismiss,
+    ToastClick,
+    /// Copies a clipboard history item back.
+    ClipCopy(usize),
+    /// The Apps page: open a pinned app, take one off, edit, add.
+    AppOpen(usize),
+    AppRemove(usize),
+    AppsEdit,
+    AppsAdd,
+    /// Pops the YouTube video playing out into the mini player.
+    MiniPlayer,
+    /// The radio: play or stop, a station, the volume.
+    RadioToggle,
+    RadioPick(usize),
+    RadioVolume(f32),
     /// Step through the prayer cities by this much.
     PrayerCity(i32),
     PrayerAlerts,
@@ -456,6 +538,9 @@ pub struct App {
     /// The download page: the link, what to save it as, and the download under way.
     dl_url: Option<String>,
     dl_kind: Kind,
+    /// The format the last download was asked in ("MP3", "WEBM", ...), and the options window.
+    dl_format: String,
+    dl_win: dl_options::DlWin,
     dl_job: Option<download::Job>,
     /// A paste with no link on the clipboard, shown as a hint for a moment.
     dl_no_link_at: Option<Instant>,
@@ -491,6 +576,68 @@ pub struct App {
     ny: f32,
     /// The Settings window.
     settings: settings::SettingsWin,
+    /// A toast on the notch, and what they watch.
+    toast: Option<toasts::Toast>,
+    watched: toasts::Watched,
+    battery_charging: bool,
+    /// Meetings from the iCal link: the feed, what it last read, the link it reads, and the
+    /// toasts already shown.
+    folder_dl: folder_downloads::Watched,
+    /// The companion: the card out (in the dhikr card's place) or waiting, what happened
+    /// lately, when you went away and how long you've been at it, the confetti, and since
+    /// when the cursor lingers by the notch.
+    companion: Option<companion::Card>,
+    card_pending: Option<companion::Card>,
+    happenings: Vec<companion::Happening>,
+    away_from: Option<Instant>,
+    active_since: Instant,
+    care_next: usize,
+    brief_checked: bool,
+    started_at: Instant,
+    confetti: Option<companion::Confetti>,
+    linger_since: Option<Instant>,
+    calendar_feed: crate::calendar::Feed,
+    calendar: crate::calendar::State,
+    calendar_url: String,
+    meetings_fired: Vec<String>,
+    last_meeting_check: Instant,
+    /// The weather (Nova mode), its feed, and when the closed notch's slides started.
+    weather: Option<crate::weather::Weather>,
+    weather_feed: crate::weather::Feed,
+    slides_at: Instant,
+    /// The song last seen, and until when a new one shows its card.
+    last_track: Option<String>,
+    track_peek_until: Option<Instant>,
+    /// Copied text, newest first (in memory only).
+    clip_history: VecDeque<String>,
+    clip_scroll: usize,
+    /// The Apps page: the Start menu being read, the icons, which are open, edit mode.
+    apps_loading: Option<std::sync::mpsc::Receiver<Vec<crate::apps::AppEntry>>>,
+    app_icons: RefCell<HashMap<String, Option<Image>>>,
+    apps_running: Vec<bool>,
+    apps_running_at: Instant,
+    apps_edit: bool,
+    apps_loaded: bool,
+    /// Quran Radio: the player, its stations being read, the list's scroll.
+    radio: crate::radio::Radio,
+    radio_loading: Option<std::sync::mpsc::Receiver<Vec<crate::radio::Station>>>,
+    radio_fetched: bool,
+    radio_scroll: usize,
+    /// Updates (and one being installed: since when, its installer), and news.
+    update_feed: crate::updater::Feed,
+    updating: Option<(Instant, std::path::PathBuf)>,
+    news_feed: crate::news::Feed,
+    /// The mini player looking for the video (Ok: it opened; Err: what to tell).
+    mini_finding: Option<std::sync::mpsc::Receiver<Result<String, &'static str>>>,
+    icons_wanted: RefCell<Vec<String>>,
+    icons_asked: Vec<String>,
+    icons_loading: Option<std::sync::mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>>,
+    /// The browser's address bar in front, when the notch sits in it (Nova mode).
+    addr_watch: crate::addrbar::Watch,
+    addr: Option<crate::addrbar::Bar>,
+    /// The theme last looked up, and whether the battery saver is on.
+    theme_cache: RefCell<Option<crate::themes::Theme>>,
+    saver_on: bool,
     /// A press away from any button (where, in screen px): moved far enough, it drags.
     press_drag: Option<(i32, i32)>,
     /// Being dragged: where the anchor is held from the cursor (px).
@@ -634,6 +781,10 @@ impl App {
             SetWindowRgn(popup_hwnd, rgn, false);
         }
         let glass_at_start = store.settings.glass;
+        let store_nova = store.settings.nova;
+        let store_radio_volume = store.radio_volume;
+        // The last weather, if it's from the last three hours.
+        let store_weather = store.weather.as_ref().filter(|(_, at)| crate::store::unix_now().saturating_sub(*at) < 3 * 3600).map(|(w, _)| w.clone());
         // HILAL_REMINDER_TEST=<index> shows that reminder right away.
         let reminder_test = std::env::var_os("HILAL_REMINDER_TEST").map(|_| (now, store.reminders.minutes));
         win::exclude_from_capture(hwnd, store.settings.glass);
@@ -714,6 +865,8 @@ impl App {
             prayer_ask_at: now,
             dl_url: None,
             dl_kind: Kind::Mp4,
+            dl_format: String::new(),
+            dl_win: dl_options::DlWin::new(),
             dl_job: None,
             dl_no_link_at: None,
             capture_until: None,
@@ -737,7 +890,54 @@ impl App {
             nx: CX,
             ny: 0.0,
             settings: settings::SettingsWin::new(),
+            toast: None,
+            watched: toasts::Watched::new(store_nova),
+            battery_charging: win::battery().is_some_and(|b| b.1),
+            folder_dl: Default::default(),
+            companion: None,
+            card_pending: None,
+            happenings: Vec::new(),
+            away_from: None,
+            active_since: now,
+            care_next: 0,
+            brief_checked: false,
+            started_at: now,
+            confetti: None,
+            linger_since: None,
+            calendar_feed: crate::calendar::Feed::start(String::new()),
+            calendar: Default::default(),
+            calendar_url: String::new(),
+            meetings_fired: Vec::new(),
+            last_meeting_check: now,
+            weather: store_weather,
+            weather_feed: crate::weather::Feed::start(store_nova),
+            slides_at: now,
+            last_track: None,
+            track_peek_until: None,
+            clip_history: VecDeque::new(),
+            clip_scroll: 0,
+            apps_loading: None,
+            app_icons: RefCell::new(HashMap::new()),
+            apps_running: Vec::new(),
+            apps_running_at: now,
+            apps_edit: false,
+            apps_loaded: false,
+            mini_finding: None,
+            radio: crate::radio::Radio::new(store_radio_volume),
+            radio_loading: None,
+            radio_fetched: false,
+            radio_scroll: 0,
+            update_feed: crate::updater::Feed::start(store_nova),
+            updating: None,
+            news_feed: crate::news::Feed::start(store_nova),
+            icons_wanted: RefCell::new(Vec::new()),
+            icons_asked: Vec::new(),
+            icons_loading: None,
             press_drag: None,
+            addr_watch: crate::addrbar::Watch::start(),
+            addr: None,
+            theme_cache: RefCell::new(None),
+            saver_on: false,
             drag: None,
             lyric_pos: Cell::new(0.0),
             last_draw: Cell::new(now),
@@ -747,7 +947,8 @@ impl App {
     /// The closed notch is a thin line: always, if chosen, or while a maximized window is
     /// in front.
     pub fn minimal(&self) -> bool {
-        self.store.settings.minimal || self.over_maximized
+        // (In a browser's address bar, the slim pill takes the thin line's place.)
+        self.store.settings.minimal || (self.over_maximized && self.addr.is_none())
     }
 
     /// The "Minimal notch" choice itself (for the tray menu).
@@ -758,6 +959,9 @@ impl App {
     /// Ctrl+Alt+H pins the notch open, until it's pressed again (then it closes, even
     /// with the mouse on it).
     pub fn hotkey(&mut self) {
+        if !self.nova() {
+            return;
+        }
         self.pinned = !self.pinned;
         self.open = self.pinned;
         self.left_at = None;
@@ -767,9 +971,121 @@ impl App {
         trace(&format!("[hotkey] pinned {}", self.pinned));
     }
 
+    /// Nova Island's features are on (else Hilal is "Classic", as it was before them).
+    pub fn nova(&self) -> bool {
+        self.store.settings.nova
+    }
+
+    /// Switches between Classic Hilal and Nova mode. Nova's own settings stay saved either
+    /// way, for when it's back.
+    pub fn set_nova(&mut self, on: bool) {
+        self.store.settings.nova = on;
+        self.store.save();
+        if !on {
+            if self.reminder.is_some() {
+                self.reminder = None;
+                self.reminder_preview = false;
+            }
+            self.reminder_next = None;
+            self.pinned = false;
+            self.drag = None;
+            self.press_drag = None;
+            if self.prayer_ask.is_some_and(|a| a.2) {
+                self.prayer_ask = None;
+            }
+        }
+        crate::set_hotkey(on);
+        self.apply_position();
+        self.apply_glass();
+        self.closed_sig.clear();
+        trace(&format!("[mode] {}", if on { "nova" } else { "classic" }));
+    }
+
+    /// The theme on the notch (Nova mode; None: Hilal's own look).
+    fn theme(&self) -> Option<crate::themes::Theme> {
+        if !self.nova() {
+            return None;
+        }
+        let id = &self.store.features.theme;
+        if self.theme_cache.borrow().as_ref().map(|t| t.id) != Some(id.as_str()) {
+            *self.theme_cache.borrow_mut() = crate::themes::by_id(id);
+        }
+        self.theme_cache.borrow().clone()
+    }
+
+    /// The slim pill in the address bar (dp): as wide as the bar's third allows, a touch
+    /// taller than the bar.
+    fn addr_pill(&self) -> (f32, f32) {
+        let Some(b) = self.addr else { return (0.0, 0.0) };
+        let k = self.gfx.scale;
+        let (w, h) = ((b.rect.right - b.rect.left) as f32 / k, (b.rect.bottom - b.rect.top) as f32 / k);
+        ((w / 3.0 - 12.0).min(380.0), (h + 6.0).clamp(22.0, 30.0))
+    }
+
+    /// The notch's place in the address bar follows the browser in front (only from the
+    /// notch's own place: not once it's been moved, nor standing on a side).
+    fn tick_addr(&mut self) {
+        let s = &self.store.settings;
+        let allowed = s.nova && self.store.features.addr_island && s.anchor.is_none() && s.docked && !s.vertical && self.drag.is_none();
+        self.addr_watch.set_on(allowed);
+        let mut next = self.addr;
+        while let Ok(b) = self.addr_watch.updates.try_recv() {
+            next = b;
+        }
+        if !allowed {
+            next = None;
+        }
+        // (While open it stays where it is.)
+        if next != self.addr && !self.open {
+            trace(&format!("[addr] {:?}", next.map(|b| (b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, b.typing))));
+            self.addr = next;
+            self.apply_position();
+            self.closed_sig.clear();
+        }
+    }
+
+    /// Animations off (chosen, or by the battery saver).
+    fn no_animations(&self) -> bool {
+        self.nova() && (self.store.features.no_animations || self.saver_on)
+    }
+
+    fn glass_frozen(&self) -> bool {
+        self.nova() && (self.store.features.glass_freeze || self.saver_on)
+    }
+
+    /// The battery saver: on below its charge (off the charger), off again above it.
+    pub(super) fn check_saver(&mut self, charging: bool, level: f32) {
+        let f = &self.store.features;
+        let on = self.nova() && f.battery_saver && !charging && level * 100.0 <= f.battery_saver_at as f32;
+        if on != self.saver_on {
+            self.saver_on = on;
+            self.apply_glass();
+            let pct = format!("{}%", (level * 100.0).round());
+            self.toast('\u{EBB5}', if on { AMBER } else { GREEN }, if on { "Battery saver is on" } else { "Battery saver is off" }, pct, None, 3500);
+        }
+    }
+
+    /// Where the notch is placed: as saved, or in Classic always hanging from the top center.
+    fn pos(&self) -> Pos {
+        let s = &self.store.settings;
+        // In a browser's address bar: its right third, the notch floating there.
+        if let Some(b) = self.addr.filter(|_| s.nova) {
+            let r = b.rect;
+            let third = (r.right - r.left) / 3;
+            let sh = self.addr_pill().1 * self.gfx.scale;
+            let top = (r.top + r.bottom) / 2 - (sh / 2.0) as i32;
+            return Pos { anchor: Some((r.right - third / 2, top)), docked: false, vertical: false, side_left: false };
+        }
+        if s.nova {
+            Pos { anchor: s.anchor, docked: s.docked, vertical: s.vertical, side_left: s.side_left }
+        } else {
+            Pos { anchor: None, docked: true, vertical: false, side_left: false }
+        }
+    }
+
     /// Standing on a side edge (the nearest one), or back to lying along the top.
     pub fn vertical(&self) -> bool {
-        self.store.settings.vertical
+        self.pos().vertical
     }
 
     pub fn set_vertical(&mut self, on: bool) {
@@ -809,7 +1125,7 @@ impl App {
     /// edge and centered on the anchor. Always inside the window (so near a screen edge
     /// it opens toward the free space).
     fn shape_rect(&self, s: Shape) -> Rect {
-        let set = &self.store.settings;
+        let set = self.pos();
         if set.vertical {
             let x = if set.side_left { 0.0 } else { WIN_W - s.w };
             let y = (self.ny - s.h / 2.0).clamp(4.0, (WIN_H - s.h - 4.0).max(4.0));
@@ -826,7 +1142,7 @@ impl App {
     /// bottom-left): square where it touches a screen edge. None for the docked notch,
     /// which has its ears instead.
     fn shape_radii(&self, s: Shape) -> Option<[f32; 4]> {
-        let set = &self.store.settings;
+        let set = self.pos();
         let r = s.r.min(s.h / 2.0).min(s.w / 2.0).max(0.0);
         if set.vertical {
             Some(if set.side_left { [0.0, r, r, 0.0] } else { [r, 0.0, 0.0, r] })
@@ -860,7 +1176,7 @@ impl App {
             let (ax, ay) = self.anchor_px;
             // Held near where it was grabbed, so the (shrinking) notch stays under the cursor.
             let ox = (p.0 - ax).clamp(-px(PILL_HALF_W - 16.0), px(PILL_HALF_W - 16.0));
-            let oy = if self.store.settings.vertical {
+            let oy = if self.pos().vertical {
                 (p.1 - ay).clamp(-px(V_HALF - 20.0), px(V_HALF - 20.0))
             } else {
                 (p.1 - ay).clamp(px(4.0), px(34.0 - 6.0))
@@ -909,7 +1225,7 @@ impl App {
         let k = self.gfx.scale;
         let px = |dp: f32| (dp * k).round() as i32;
         let (ww, wh) = (px(WIN_W), px(WIN_H));
-        let set = &self.store.settings;
+        let set = self.pos();
         let (b, wa) = monitor_at(set.anchor.unwrap_or((0, 0)));
         let (mut ax, mut ay) = set.anchor.unwrap_or(((b.left + b.right) / 2, b.top));
         let (wx, wy);
@@ -1080,11 +1396,15 @@ impl App {
                 if self.store.prayer.alerted != (day, i) {
                     self.store.prayer.alerted = (day, i);
                     self.store.save();
-                    self.prayer_ask = Some((i, at, false));
-                    self.prayer_ask_at = now;
+                    if self.nova() && self.store.features.nova_prayer {
+                        self.adhan_scene(i, at);
+                    } else {
+                        self.prayer_ask = Some((i, at, false));
+                        self.prayer_ask_at = now;
+                    }
                     crate::sound::play_prayer();
                 }
-            } else if let Some((day, i, at)) = prayer::coming(&place, PRAYER_HEADSUP, calc) {
+            } else if let Some((day, i, at)) = self.nova().then(|| prayer::coming(&place, PRAYER_HEADSUP, calc)).flatten() {
                 // A silent heads-up a few minutes before, for a few seconds.
                 if self.store.prayer.headsup != (day, i) {
                     self.store.prayer.headsup = (day, i);
@@ -1100,9 +1420,10 @@ impl App {
         // other peek, or welcome.
         let dt = now - self.reminder_tick;
         self.reminder_tick = now;
+        let nova = self.store.settings.nova;
         let r = &self.store.reminders;
         if self.reminder.is_some() {
-            if !r.on && !self.reminder_preview {
+            if (!r.on || !nova) && !self.reminder_preview {
                 self.hide_reminder();
             } else {
                 if self.inside {
@@ -1112,7 +1433,7 @@ impl App {
                     self.hide_reminder();
                 }
             }
-        } else if r.on {
+        } else if r.on && nova {
             let every = r.minutes;
             let due = match self.reminder_next {
                 Some((at, counted)) if counted == every => at,
@@ -1140,21 +1461,57 @@ impl App {
             crate::sound::play_chime();
         }
         self.check_tasks();
+        if !self.pages().contains(&self.page) {
+            self.set_page(0);
+        }
         self.tick_settings();
+        self.tick_dl();
+        self.tick_toasts();
+        self.tick_apps();
+        self.tick_meetings();
+        self.tick_folder_downloads();
+        self.tick_companion();
+        self.tick_addr();
+        self.tick_extras();
+        if self.open && self.page == Page::Radio {
+            self.radio_seen();
+        }
+        if let Some(Ok(found)) = self.mini_finding.as_ref().map(|rx| rx.try_recv()) {
+            self.mini_finding = None;
+            match found {
+                // The browser's copy pauses; the mini player carries on.
+                Ok(_) => {
+                    if self.track.as_ref().is_some_and(|t| t.playing) {
+                        self.media.send(Command::PlayPause);
+                    }
+                    self.open = false;
+                    self.pinned = false;
+                }
+                Err(why) => self.toast('\u{E783}', rgb(0xff, 0x8a, 0x80), why, "", None, 3500),
+            }
+        }
         if self.pomo.finished() {
             unsafe {
                 let _ = MessageBeep(MB_ICONASTERISK);
+            }
+            // (Now on a break: a focus session just ended.)
+            if self.pomo.brk {
+                self.focus_scene(false);
             }
             self.alert(Page::Pomo);
         }
 
         self.track = self.media.current();
+        self.follow_track();
         self.sync_art();
         if let Some(t) = &self.track {
             self.lyrics.follow(&t.title, &t.artist, t.end_ms());
         }
 
         self.anim.step();
+        if self.no_animations() {
+            self.anim.snap();
+        }
 
         // Where is the cursor relative to the notch?
         if let Some((px, py)) = win::cursor_px() {
@@ -1164,14 +1521,16 @@ impl App {
         let shape = self.anim.value();
         let notch = self.shape_rect(shape);
         // (Hanging from the top, the screen's very top row counts too.)
-        let cy = if self.store.settings.docked && !self.store.settings.vertical { self.cursor.1.max(0.0) } else { self.cursor.1 };
+        let cy = if self.pos().docked && !self.pos().vertical { self.cursor.1.max(0.0) } else { self.cursor.1 };
         self.inside = notch.grow(3.0).contains(self.cursor.0, cy);
+        let near = notch.grow(70.0).contains(self.cursor.0, cy);
+        self.follow_linger(near);
         self.follow_drag();
         let button_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
         // A button held while entering means something is being dragged in (files, usually).
         self.file_hover = self.inside && button_down && self.pressed.is_none() && (self.file_hover || !self.open || self.page == Page::Shelf);
         if self.file_hover && self.page != Page::Shelf {
-            self.set_page(Page::Shelf.index());
+            self.show_page(Page::Shelf);
         }
 
         let alerting = self.alert_until.is_some_and(|t| now < t);
@@ -1188,7 +1547,8 @@ impl App {
         if !self.inside {
             self.hover_blocked = false;
         }
-        let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none();
+        let toast_click = self.toast_shown() && self.toast.as_ref().is_some_and(|t| t.action.is_some());
+        let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none() && !toast_click;
         if hover_opens || self.form.is_some() || alerting || self.pinned {
             if !self.open {
                 trace(&format!("[open] hover {} rested {:?} over maximized {} form {} alert {}", hover_opens, self.hover_since.map(|t| (now - t).as_millis()), self.over_maximized, self.form.is_some(), alerting));
@@ -1226,7 +1586,9 @@ impl App {
         // Keep the glass fed with what's behind it; retry quietly if capture isn't available.
         // During a screenshot the capture would see us, so the glass keeps its last image.
         let mut backdrop_changed = false;
-        if self.glass_live && self.capture_until.is_none() {
+        // (Frozen glass refreshes only while the notch is open.)
+        let frozen = self.glass_frozen() && !self.open;
+        if self.glass_live && self.capture_until.is_none() && !frozen {
             if !self.gfx.has_backdrop() && self.backdrop_retry.elapsed() > Duration::from_secs(3) {
                 self.backdrop_retry = now;
                 self.gfx.enable_backdrop();
@@ -1246,7 +1608,7 @@ impl App {
         // Live stats feed the System page and the FPS overlay, and only run while shown.
         let overlay_on = self.store.settings.overlay;
         let on_system = self.open && self.page == Page::System;
-        let side_stats = self.store.settings.vertical && !self.open;
+        let side_stats = (self.pos().vertical || (self.nova_idle() && self.store.features.slide_stats)) && !self.open;
         self.sysmon.set_active(on_system || overlay_on || side_stats);
         self.meter.set_active(self.track.as_ref().is_some_and(|t| t.playing));
         if on_system || overlay_on || side_stats {
@@ -1266,7 +1628,7 @@ impl App {
         let animating = !self.anim.done();
         let playing = self.track.as_ref().is_some_and(|t| t.playing);
         let busy = animating || self.open || playing || self.welcoming() || self.file_hover || self.peeking() || self.popup.animating()
-            || self.drag.is_some() || self.press_drag.is_some();
+            || self.drag.is_some() || self.press_drag.is_some() || self.toast_shown() || self.confetti_up() || self.eyes_shown();
         let sig = self.closed_signature();
         if busy || backdrop_changed || sig != self.closed_sig {
             self.closed_sig = sig;
@@ -1515,6 +1877,19 @@ impl App {
     /// set once to cover the whole motion (with room for overshoot), so it never has to
     /// chase the shape frame by frame.
     fn update_region(&mut self) {
+        // Confetti flies outside the notch: the whole window takes the mouse meanwhile.
+        if self.confetti_up() {
+            let k = self.gfx.scale;
+            let all = [0, 0, (WIN_W * k) as i32, (WIN_H * k) as i32];
+            if self.region != all {
+                self.region = all;
+                self.region_shape = None;
+                unsafe {
+                    SetWindowRgn(self.hwnd, CreateRectRgn(0, 0, all[2], all[3]), false);
+                }
+            }
+            return;
+        }
         let cur = self.anim.value();
         let s = if self.anim.done() {
             cur
@@ -1573,9 +1948,9 @@ impl App {
             }
             format!("mid-{}x{}", t.w as i32, t.h as i32)
         } else {
-            let page = ["music", "pomo", "water", "prayer", "download", "claude", "shelf", "todo", "system"][self.page.index()];
+            let page = if self.page == Page::Radio { format!("radio-{:?}", self.radio.state()) } else if self.page == Page::Apps { format!("apps-{}-icons{}", self.pinned_apps().len(), self.app_icons.borrow().values().filter(|i| i.is_some()).count()) } else { self.page.name().to_owned() };
             let what = if !self.open {
-                if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else if self.reminder.is_some() { "reminder-peek".to_owned() } else { "closed".to_owned() }
+                if self.welcoming() { "welcome".to_owned() } else if self.prayer_ask.is_some() { "prayer-peek".to_owned() } else if self.water_ask.is_some() { "water-peek".to_owned() } else if self.toast_shown() { self.toast.as_ref().map_or(String::new(), |t| format!("toast-{:04X}-{}", t.icon as u32, t.value.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect::<String>())) } else if self.reminder.is_some() { "reminder-peek".to_owned() } else if self.track_peeking() { "track-peek".to_owned() } else if self.nova_idle() && self.eyes_shown() { "closed-eyes".to_owned() } else if self.nova_idle() { format!("closed-slide{}", self.slide_now()) } else { "closed".to_owned() }
             } else if self.page == Page::Water && self.water_settings {
                 "water-settings".to_owned()
             } else if self.page == Page::Music && self.lyrics_on {
@@ -1637,7 +2012,8 @@ impl App {
     /// Whether the glass is live right now: chosen, and nothing asks for the notch to show
     /// up in captures (the sharing option, or a recorder running).
     fn apply_glass(&mut self) {
-        let want = self.store.settings.glass && !self.share_visible && !self.recorder;
+        let nova = self.store.settings.nova;
+        let want = self.store.settings.glass && !(nova && (self.share_visible || self.recorder || self.saver_on));
         if want == self.glass_live {
             return;
         }
@@ -1671,10 +2047,16 @@ impl App {
         if self.welcoming() || self.water_ask.is_some() || self.prayer_ask.is_some() {
             return PEEK;
         }
+        if self.toast_shown() {
+            return if self.pos().vertical { toasts::V_TOAST } else { toasts::TOAST };
+        }
+        if self.track_peeking() {
+            return PEEK;
+        }
         if self.reminder.is_some() {
             return self.reminder_card.0;
         }
-        if self.store.settings.vertical {
+        if self.pos().vertical {
             let busy = self.track.as_ref().is_some_and(|t| t.playing) || self.pomo.running();
             return if self.store.settings.minimal { V_MINIMAL } else if busy { V_COMPACT } else { V_IDLE };
         }
@@ -1683,14 +2065,33 @@ impl App {
             let w = (self.gfx.measure(&line, 13.0, 600) + 80.0).clamp(IDLE.w, WIDE.w);
             return Shape { w, ..IDLE };
         }
-        if self.minimal() { MINIMAL } else { IDLE }
+        if let Some(b) = self.addr {
+            // A thin line while the address is being typed.
+            if b.typing {
+                return Shape { w: 90.0, h: 3.0, r: 1.5, e: 0.0 };
+            }
+            let (w, h) = self.addr_pill();
+            return Shape { w, h, r: h / 2.0, e: 0.0 };
+        }
+        if self.minimal() { MINIMAL } else if self.nova_idle() { slides::N_IDLE } else { IDLE }
     }
 
     /// The closed notch only needs redrawing when what it shows changes.
     fn closed_signature(&self) -> String {
         // (On a side it also shows the CPU and memory load.)
-        let stats = if self.store.settings.vertical { (self.stats_now.cpu * 100.0).round() as i32 * 1000 + self.ram_pct() } else { 0 };
-        format!("{}|{:?}|{}|{}|{:?}|{stats}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal(), self.water_ask)
+        let stats = if self.pos().vertical { (self.stats_now.cpu * 100.0).round() as i32 * 1000 + self.ram_pct() } else { 0 };
+        let dots = (self.watched.mic.len(), self.watched.cam.len());
+        // Nova's slides: which shows, and (for the CPU and memory) their load.
+        let slide = if self.nova_idle() {
+            let t = self.slides_at.elapsed().as_secs_f32();
+            // (A fade in, a frame at a time, for the first third of a second of each.)
+            let fading = t % 6.0 < 0.35;
+            format!("{}{}{}", (t / 6.0) as u64, if fading { format!("~{}", (t * 30.0) as u64) } else { String::new() }, (self.stats_now.cpu * 100.0).round() as i32)
+        } else {
+            String::new()
+        };
+        let dots = (dots, slide, self.weather.as_ref().map(|w| w.temp));
+        format!("{}|{:?}|{}|{}|{:?}|{stats}|{dots:?}", win::clock(), self.closed_lyric(), self.pomo.remaining().as_secs(), self.minimal(), self.water_ask)
     }
 
     /// A reminder (water or prayer) is showing in the notch.
@@ -1730,6 +2131,9 @@ impl App {
 
     /// "Show one now": a card right away, even with the reminders off.
     pub fn reminder_now(&mut self) {
+        if !self.nova() {
+            return;
+        }
         self.show_reminder(true);
     }
 
@@ -1748,6 +2152,9 @@ impl App {
 
     /// The card leaves; the next one is counted from now.
     fn hide_reminder(&mut self) {
+        if self.companion.take().is_some_and(|c| c.stops_sound) {
+            crate::sound::stop();
+        }
         self.reminder = None;
         self.reminder_preview = false;
         // (so it doesn't spring open under the mouse as the card goes)
@@ -1764,7 +2171,7 @@ impl App {
         // Diacritics and Qur'anic marks add characters but no width.
         let len = item.text.chars().filter(|c| !matches!(*c as u32, 0x64B..=0x65F | 0x670 | 0x6D6..=0x6ED)).count();
         let mut fs: f32 = if len <= 40 { 30.0 } else if len <= 80 { 26.0 } else { 23.0 };
-        let w = if self.store.settings.vertical { REMINDER_W_SIDE } else { REMINDER_W };
+        let w = if self.pos().vertical { REMINDER_W_SIDE } else { REMINDER_W };
         // Inside: 12 padding, 24 head, 6 + 6 gaps, 16 source line, 16 bottom (and 2 spare).
         let mut h = self.gfx.quran_height(&text, w - 44.0, fs, &spans);
         while fs > 17.0 && h + 82.0 > REMINDER_MAX_H {
@@ -1776,7 +2183,7 @@ impl App {
     }
 
     fn alert(&mut self, page: Page) {
-        self.set_page(page.index());
+        self.show_page(page);
         self.alert_until = Some(Instant::now() + ALERT_OPEN);
     }
 
@@ -1822,8 +2229,31 @@ impl App {
         }
     }
 
+    /// The pages to flip through: Classic's, or Nova mode's that are switched on.
+    fn pages(&self) -> Vec<Page> {
+        if !self.nova() {
+            return PAGES.to_vec();
+        }
+        let hidden = &self.store.features.hidden_pages;
+        let list: Vec<Page> = NOVA_PAGES.iter().copied().filter(|p| !hidden.iter().any(|h| h == p.name())).collect();
+        if list.is_empty() { vec![Page::Music] } else { list }
+    }
+
+    /// Where the current page is in the list.
+    fn page_pos(&self) -> usize {
+        self.pages().iter().position(|p| *p == self.page).unwrap_or(0)
+    }
+
+    /// Goes to a page (if it's in the list).
+    fn show_page(&mut self, page: Page) {
+        if let Some(i) = self.pages().iter().position(|p| *p == page) {
+            self.set_page(i);
+        }
+    }
+
     fn set_page(&mut self, i: usize) {
-        let page = PAGES[i % PAGES.len()];
+        let pages = self.pages();
+        let page = pages[i % pages.len()];
         if page != self.page {
             self.page = page;
             self.page_at = Instant::now();
@@ -1888,7 +2318,7 @@ impl App {
     pub fn mouse_down(&mut self, x: f32, y: f32) {
         self.pressed = self.region_at(x, y).map(|a| (a, x, y));
         // Away from the buttons a press may become a drag (once it moves).
-        if self.pressed.is_none() && self.form.is_none() {
+        if self.pressed.is_none() && self.form.is_none() && self.nova() {
             self.press_drag = win::cursor_px();
         }
         self.press_fx = self.pressed.map(|(a, _, _)| (a, Instant::now(), None));
@@ -1933,6 +2363,15 @@ impl App {
         if self.page == Page::Todo && lx > 198.0 && y > 30.0 && self.store.tasks.len() > 3 {
             let max = self.store.tasks.len() - 3;
             self.todo_scroll = if down { (self.todo_scroll + 1).min(max) } else { self.todo_scroll.saturating_sub(1) };
+            return;
+        }
+        if self.page == Page::Clipboard && lx > 198.0 && y > 30.0 && self.clip_history.len() > 4 {
+            let max = self.clip_history.len() - 4;
+            self.clip_scroll = if down { (self.clip_scroll + 1).min(max) } else { self.clip_scroll.saturating_sub(1) };
+            return;
+        }
+        if self.page == Page::Radio && lx > 208.0 && y > 30.0 {
+            self.radio_scroll_by(down);
             return;
         }
         if self.page == Page::Claude && y > 30.0 && self.claude_list.len() > 3 {
@@ -2011,17 +2450,18 @@ impl App {
         self.file_hover = false;
         self.open = true;
         self.left_at = None;
-        self.set_page(Page::Shelf.index());
+        self.show_page(Page::Shelf);
     }
 
     fn perform(&mut self, a: Action, x: f32) {
         trace(&format!("[action] {a:?}"));
         use Action::*;
-        let idx = self.page.index();
+        let idx = self.page_pos();
+        let count = self.pages().len();
         let w = &mut self.store.water;
         let mut save = true;
         match a {
-            PagePrev => self.set_page(idx + PAGES.len() - 1),
+            PagePrev => self.set_page(idx + count - 1),
             PageNext => self.set_page(idx + 1),
             Page(i) => self.set_page(i),
             PlayPause => self.media.send(Command::PlayPause),
@@ -2035,7 +2475,13 @@ impl App {
                 }
             }
             SeekTo(ms) => self.media.send(Command::Seek(ms)),
-            PomoToggle => self.pomo.toggle(),
+            PomoToggle => {
+                let starting = !self.pomo.running() && !self.pomo.brk;
+                self.pomo.toggle();
+                if starting && self.pomo.running() {
+                    self.focus_scene(true);
+                }
+            }
             PomoReset => self.pomo.set_mode(self.pomo.brk),
             PomoMode(brk) => self.pomo.set_mode(brk),
             WaterSwitch => {
@@ -2047,11 +2493,18 @@ impl App {
                     self.water_ask = None;
                 }
             }
-            Drink => w.drink(),
+            Drink => {
+                let below = w.drunk_ml < w.goal_ml;
+                w.drink();
+                if below && w.drunk_ml >= w.goal_ml {
+                    self.celebrate(&[rgb(0x40, 0xc8, 0xff), rgb(0x30, 0xd1, 0x58), WHITE]);
+                }
+            }
             PrayerCity(d) => {
-                let n = crate::prayer::CHOICES as i32;
+                let n = self.prayer_choices() as i32;
                 let p = &mut self.store.prayer;
-                p.city = (p.city as i32 + d).rem_euclid(n) as usize;
+                let from = if (p.city as i32) < n { p.city as i32 } else { 0 };
+                p.city = (from + d).rem_euclid(n) as usize;
             }
             PrayerAlerts => {
                 let p = &mut self.store.prayer;
@@ -2080,9 +2533,8 @@ impl App {
                 save = false;
             }
             DlStart => {
-                if let Some(url) = &self.dl_url {
-                    self.dl_job = Some(download::start(url, self.dl_kind));
-                }
+                // The options first: type, format, quality, name and tags.
+                self.open_dl_options();
                 save = false;
             }
             DlCancel => {
@@ -2104,6 +2556,61 @@ impl App {
             }
             ReminderDismiss => {
                 self.hide_reminder();
+                save = false;
+            }
+            ToastClick => {
+                self.toast_click();
+                save = false;
+            }
+            ClipCopy(i) => {
+                self.clip_copy(i);
+                save = false;
+            }
+            AppOpen(i) => {
+                if let Some(a) = self.pinned_apps().get(i) {
+                    crate::apps::open(&a.id);
+                }
+                save = false;
+            }
+            AppRemove(i) => {
+                let mut list = self.pinned_apps();
+                if i < list.len() {
+                    list.remove(i);
+                }
+                self.store.apps_pinned = Some(list);
+            }
+            AppsEdit => {
+                self.apps_edit = !self.apps_edit;
+                save = false;
+            }
+            AppsAdd => {
+                self.open_settings_at(4);
+                save = false;
+            }
+            RadioToggle => {
+                self.radio_toggle();
+                save = false;
+            }
+            RadioPick(i) => {
+                self.radio_pick(i);
+                save = false;
+            }
+            RadioVolume(d) => self.radio_volume(d as f64),
+            MiniPlayer => {
+                if self.mini_finding.is_none() {
+                    if let Some(t) = &self.track {
+                        let (title, secs) = (t.title.clone(), (t.position_ms().max(0) / 1000) as u64);
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let found = crate::mini::find(&title);
+                            if let Ok((id, _)) = &found {
+                                crate::mini::open(id, secs);
+                            }
+                            let _ = tx.send(found.map(|f| f.0));
+                        });
+                        self.mini_finding = Some(rx);
+                    }
+                }
                 save = false;
             }
             PrayerDismiss => {
@@ -2281,8 +2788,19 @@ impl App {
         let g = &self.gfx;
         let notch = self.shape_rect(s);
         let cx = notch.x + notch.w / 2.0;
-        let e = match self.shape_radii(s) {
-            None => {
+        let theme = self.theme();
+        g.ink.set(theme.as_ref().and_then(|t| t.ink));
+        // (The retro theme's corners are nearly square.)
+        let s = match theme.as_ref().and_then(|t| t.radius) {
+            Some(r) => Shape { r: s.r.min(r), ..s },
+            None => s,
+        };
+        let e = match (self.shape_radii(s), &theme) {
+            (radii, Some(t)) => {
+                g.themed((cx, s.w, s.h, s.r, s.e), radii.map(|r| (notch, r)), t, self.glass_live);
+                if radii.is_none() { s.e } else { 0.0 }
+            }
+            (None, None) => {
                 if self.glass_live {
                     g.glass(cx, s.w, s.h, s.r, s.e);
                 } else {
@@ -2290,7 +2808,7 @@ impl App {
                 }
                 s.e
             }
-            Some(radii) => {
+            (Some(radii), None) => {
                 if self.glass_live {
                     g.glass_slab(notch, radii);
                 } else {
@@ -2303,7 +2821,7 @@ impl App {
         // Everything inside is drawn from the notch's top.
         g.set_dy(notch.y);
         self.oy.set(notch.y);
-        let vertical = self.store.settings.vertical;
+        let vertical = self.pos().vertical;
 
         // The reminder card is tall like a page, but it isn't one: no page fades in under it,
         // nor as its shell shrinks back afterwards.
@@ -2332,6 +2850,9 @@ impl App {
                 self.page_content();
             }
         }
+        // A toast takes the closed notch's place (fading in over a fifth of a second).
+        let toast_a = if self.toast_shown() && !self.open { self.toast.as_ref().map_or(0.0, |t| (t.at.elapsed().as_secs_f32() / 0.2).min(1.0)) } else { 0.0 };
+        let closed_a = closed_a * (1.0 - toast_a);
         if closed_a > 0.0 && s.h > 12.0 && s.w > 12.0 {
             g.fade.set(closed_a);
             self.ox.set(0.0);
@@ -2347,6 +2868,7 @@ impl App {
                 match (self.water_ask, self.prayer_ask) {
                     (Some(ask), _) if !self.welcoming() => self.water_ask_view(ask),
                     (None, Some((i, at, soon))) if !self.welcoming() => self.prayer_ask_view(i, at, soon),
+                    (None, None) if self.track_peeking() && !self.welcoming() => self.track_peek_view(),
                     _ => self.welcome_view(),
                 }
             }
@@ -2357,11 +2879,28 @@ impl App {
                 g.fade.set(a);
                 self.ox.set(notch.x + (s.w - self.reminder_card.0.w) / 2.0);
                 g.offset(self.ox.get());
-                self.reminder_view(i);
+                if i == companion::CARD {
+                    self.card_view();
+                } else {
+                    self.reminder_view(i);
+                }
             }
         }
+        if toast_a > 0.0 {
+            self.ox.set(0.0);
+            g.offset(0.0);
+            self.toast_view(s, toast_a);
+        }
+        self.ox.set(0.0);
+        g.offset(0.0);
+        self.privacy_dots(s);
         g.offset(0.0);
         g.unclip();
+        if self.confetti_up() {
+            g.set_dy(0.0);
+            self.confetti_view();
+        }
+        g.ink.set(None);
         self.last_draw.set(Instant::now());
         let cpu = self.frame_start.elapsed().max(started.elapsed());
         if started.elapsed() > Duration::from_millis(50) {
@@ -2489,7 +3028,12 @@ impl App {
         let (title, sub) = if soon {
             (format!("{} in {PRAYER_HEADSUP} minutes", prayer::NAMES[i]), format!("Get ready · {time}"))
         } else {
-            (format!("{} prayer", prayer::NAMES[i]), format!("It's time to pray · {time}"))
+            let (y, m, d, _) = prayer::local_now(&self.prayer_place());
+            if i == 4 && self.ramadan(y, m, d) {
+                (format!("{} prayer", prayer::NAMES[i]), format!("\u{062a}\u{0642}\u{0628}\u{0651}\u{0644} \u{0627}\u{0644}\u{0644}\u{0647} \u{0635}\u{064a}\u{0627}\u{0645}\u{0643} · {time}"))
+            } else {
+                (format!("{} prayer", prayer::NAMES[i]), format!("It's time to pray · {time}"))
+            }
         };
         g.text(&title, 60.0, 23.0, ok.x - 64.0, 14.0, 700, WHITE, Align::Start);
         g.text(&sub, 60.0, 40.0, ok.x - 64.0, 10.5, 400, white(0.55), Align::Start);
@@ -2582,6 +3126,9 @@ impl App {
             Page::Shelf => self.shelf_page(),
             Page::Todo => self.todo_page(),
             Page::System => self.system_page(),
+            Page::Clipboard => self.clipboard_page(),
+            Page::Apps => self.apps_page(),
+            Page::Radio => self.radio_page(),
         }
         if !(self.page == Page::Water && self.water_settings) {
             self.nav();
@@ -2600,6 +3147,7 @@ impl App {
             }
         }
         self.clock_group(216.0, 19.0);
+        self.header_weather();
     }
 
     /// The time the iOS way: digits in the display face, AM/PM smaller and dimmer beside
@@ -2664,9 +3212,10 @@ impl App {
             g.unscale();
             self.hit(r, a);
         }
-        let active = self.page.index();
-        let widths: Vec<f32> = (0..PAGES.len()).map(|i| if i == active { 15.0 } else { 3.6 }).collect();
-        let total: f32 = widths.iter().sum::<f32>() + 4.5 * (PAGES.len() - 1) as f32;
+        let active = self.page_pos();
+        let count = self.pages().len();
+        let widths: Vec<f32> = (0..count).map(|i| if i == active { 15.0 } else { 3.6 }).collect();
+        let total: f32 = widths.iter().sum::<f32>() + 4.5 * (count - 1) as f32;
         let mut x = 210.0 - total / 2.0;
         for (i, w) in widths.into_iter().enumerate() {
             g.fill_rrect(Rect::new(x, 131.2, w, 3.6), 1.8, if i == active { WHITE } else { white(0.45) });
@@ -2733,7 +3282,7 @@ impl App {
     // ----- closed notch -----------------------------------------------------------------
 
     fn closed(&self, s: Shape) {
-        if self.store.settings.vertical {
+        if self.pos().vertical {
             return self.closed_side(s);
         }
         let g = &self.gfx;
@@ -2765,6 +3314,10 @@ impl App {
             g.stroke_circle(x0 + 20.0, cy, 6.0, 2.2, rgba(0xff, 0x4b, 0x55, 0.3));
             g.arc(x0 + 20.0, cy, 6.0, 0.0, frac * 360.0, 2.2, RED);
             g.text(&mmss(left.as_millis() as i64), x0 + s.w - 70.0, cy, 56.0, 13.0, 600, WHITE, Align::End);
+        } else if self.nova_idle() && self.eyes_shown() {
+            self.eyes_view(s);
+        } else if self.nova_idle() {
+            self.closed_slides(s);
         } else if !self.minimal() {
             let w = self.time_width(14.5, 600);
             self.time(x0 + (s.w - w) / 2.0, cy, 14.5, 600, white(0.95));
@@ -2960,6 +3513,16 @@ impl App {
             }
         }
         self.hit(b.grow(6.0), Action::Lyrics);
+        if self.nova() && t.is_some() && !std::ptr::eq(l, &SPLIT) {
+            // The mini player: a small window with a smaller one in its corner.
+            let px = l.bubble + 26.0;
+            let r = Rect::centered(px, cy - 1.0, 18.0, 13.0);
+            let busy = self.mini_finding.is_some();
+            let c = white(if busy { 0.4 } else if self.hovered(r.grow(4.0)) { 1.0 } else { 0.85 });
+            g.stroke_rrect(r, 3.0, 1.5, c, false);
+            g.fill_rrect(Rect::new(r.x + r.w - 9.0, r.y + r.h - 7.0, 7.0, 5.0), 1.5, c);
+            self.hit(r.grow(6.0), Action::MiniPlayer);
+        }
 
         let tri = |cx: f32, dir: f32| {
             for k in [-1.0f32, 0.0] {
@@ -3269,17 +3832,40 @@ impl App {
 
     /// The choices that change the times.
     fn prayer_calc(&self) -> prayer::Calc {
+        if !self.nova() {
+            return prayer::Calc::default();
+        }
         prayer::Calc { hijri_adjust: self.store.prayer.hijri_adjust, hanafi: self.store.prayer.hanafi }
+    }
+
+    /// The cities to choose from: Classic has only Egypt's (the first 33).
+    fn prayer_choices(&self) -> usize {
+        if self.nova() { prayer::CHOICES } else { EGYPT_CITIES }
+    }
+
+    /// Ramadan at the place (HILAL_RAMADAN_TEST makes any day one, for testing).
+    fn ramadan(&self, y: i32, m: u32, d: u32) -> bool {
+        self.nova()
+            && (std::env::var_os("HILAL_RAMADAN_TEST").is_some()
+                || prayer::hijri(y, m, d, self.store.prayer.hijri_adjust).is_some_and(|h| h.1 == 9))
     }
 
     /// The place the prayer times are for.
     fn prayer_place(&self) -> prayer::Place {
+        if !self.nova() {
+            // Classic: Egypt's cities only, on the PC's own clock.
+            let city = if self.store.prayer.city < EGYPT_CITIES { self.store.prayer.city } else { 0 };
+            return prayer::Place { tz: String::new(), ..prayer::place(city, None) };
+        }
         prayer::place(self.store.prayer.city, self.store.prayer.auto.as_ref())
     }
 
     /// With "Auto" chosen, looks the PC's place up once a day (in the background) and keeps
     /// the answer; when every service fails, it tries again half an hour later.
     fn keep_located(&mut self) {
+        if !self.nova() {
+            return;
+        }
         if let Some(rx) = &self.locating {
             match rx.try_recv() {
                 Ok(found) => {
@@ -3310,7 +3896,7 @@ impl App {
         let g = &self.gfx;
         self.header("Prayer ", Some(("Times", AMBER)));
         let place = self.prayer_place();
-        let auto = self.store.prayer.city >= prayer::AUTO;
+        let auto = self.nova() && self.store.prayer.city >= prayer::AUTO;
         let city = match (auto, &self.store.prayer.auto) {
             (true, Some(a)) => format!("Auto · {}", a.city),
             (true, None) if place.approx => format!("Auto · ~{}", place.name),
@@ -3342,10 +3928,21 @@ impl App {
         };
 
         // Left: the next prayer, when, how long until it, and the city.
-        g.text("Next prayer", 44.0, 41.0, 150.0, 10.5, 500, white(0.55), Align::Start);
-        // Today's Hijri date, small, at the other end of the line.
-        if let Some((hijri, _)) = prayer::hijri(y, m, d, calc.hijri_adjust) {
-            g.text(&hijri, 100.0, 41.0, 96.0, 10.0, 500, rgba(0xff, 0xc4, 0x3d, 0.75), Align::End);
+        // In Ramadan (as Nova Island has it): "Ramadan Kareem" over the next prayer, the
+        // time and countdown to iftar (until Maghrib) or to the next imsak (ten minutes
+        // before Fajr), and Maghrib marked as iftar.
+        let ramadan = self.ramadan(y, m, d);
+        let hijri = self.nova().then(|| prayer::hijri(y, m, d, calc.hijri_adjust)).flatten().map(|h| h.0);
+        if ramadan {
+            // The whole line: "Ramadan Kareem · the Hijri date".
+            let line = format!("\u{0631}\u{0645}\u{0636}\u{0627}\u{0646} \u{0643}\u{0631}\u{064a}\u{0645}{}", hijri.map_or(String::new(), |h| format!(" \u{00b7} {}", h.rsplit_once(' ').map_or(h.as_str(), |(day, _)| day))));
+            g.text(&line, 44.0, 41.0, 152.0, 10.5, 600, AMBER, Align::Start);
+        } else {
+            g.text("Next prayer", 44.0, 41.0, 150.0, 10.5, 500, white(0.55), Align::Start);
+            // Today's Hijri date, small, at the other end of the line.
+            if let Some(hijri) = hijri {
+                g.text(&hijri, 100.0, 41.0, 96.0, 10.0, 500, rgba(0xff, 0xc4, 0x3d, 0.75), Align::End);
+            }
         }
         let nw = g.text(prayer::NAMES[next], 44.0, 60.0, 150.0, 21.0, 700, WHITE, Align::Start);
         let at = next_at / 60 % 1440;
@@ -3353,6 +3950,30 @@ impl App {
         let left = (next_at - now).max(0);
         let until = if left >= 3600 { format!("in {}h {}m", left / 3600, left / 60 % 60) } else { format!("in {}m {:02}s", left / 60, left % 60) };
         g.display(&until, 44.0, 78.0, 150.0, 11.5, 600, AMBER, Align::Start);
+        if ramadan {
+            let today = prayer::day_times(&place, y, m, d, calc);
+            let (yy, mm, dd) = prayer::next_day(y, m, d);
+            // (Past Isha `now` counts from tomorrow's midnight; this is the clock today.)
+            let real_now = now.rem_euclid(86_400);
+            let imsak = (today[0] - 10) * 60;
+            let iftar = today[4] * 60;
+            let (name, at) = if real_now >= imsak && real_now < iftar {
+                ("\u{0627}\u{0644}\u{0625}\u{0641}\u{0637}\u{0627}\u{0631}", iftar)
+            } else if real_now < imsak {
+                ("\u{0627}\u{0644}\u{0625}\u{0645}\u{0633}\u{0627}\u{0643}", imsak)
+            } else {
+                let tomorrow = prayer::day_times(&place, yy, mm, dd, calc);
+                ("\u{0627}\u{0644}\u{0625}\u{0645}\u{0633}\u{0627}\u{0643}", 86_400 + (tomorrow[0] - 10) * 60)
+            };
+            let hm = at / 60 % 1440;
+            // The word, then the time to its left (two pieces, so the time reads left to right).
+            let time = win::hm_text((hm / 60) as u16, (hm % 60) as u16);
+            let light = rgb(0xff, 0xe0, 0x8a);
+            let nw = g.measure(name, 10.5, 600) + 2.0;
+            let tw = g.measure(&time, 10.5, 600) + 2.0;
+            g.text(name, 196.0 - nw, 78.0, nw, 10.5, 600, light, Align::Start);
+            g.text(&time, 196.0 - nw - 4.0 - tw, 78.0, tw, 10.5, 600, light, Align::Start);
+        }
         let frac = ((now - prev_at) as f32 / (next_at - prev_at).max(1) as f32).clamp(0.0, 1.0);
         g.fill_rrect(Rect::new(44.0, 88.0, 152.0, 4.0), 2.0, white(0.15));
         if frac > 0.0 {
@@ -3379,6 +4000,7 @@ impl App {
                 g.fill_rrect(cell, 11.0, white(0.07));
             }
             let name_c = if is_next { AMBER } else { white(if past { 0.35 } else { 0.6 }) };
+            let name = if ramadan && i == 4 { "Iftar" } else { name };
             g.text(name, cell.x, cell.y + 13.0, cell.w, 10.0, 600, name_c, Align::Center);
             let (hm, ampm) = win::hm((t[i] / 60 % 24) as u16, (t[i] % 60) as u16);
             let c = white(if past { 0.45 } else { 1.0 });
@@ -3805,7 +4427,7 @@ impl App {
             g.text("Saves to Downloads\\Hilal", 44.0, 118.0, 340.0, 10.5, 400, white(0.4), Align::Start);
             return;
         };
-        let what = if self.dl_kind == Kind::Mp3 { "MP3" } else { "MP4" };
+        let what = if !self.dl_format.is_empty() { self.dl_format.as_str() } else if self.dl_kind == Kind::Mp3 { "MP3" } else { "MP4" };
         let bar = |frac: f32, c: Color| {
             g.fill_rrect(Rect::new(44.0, 106.0, 340.0, 4.0), 2.0, white(0.12));
             if frac > 0.0 {

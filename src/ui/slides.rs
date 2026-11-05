@@ -64,7 +64,8 @@ impl App {
         let fade = g.fade.get();
         g.fade.set(fade * a);
         let cy = s.h / 2.0;
-        let (l, r) = (b.x + 16.0, b.x + s.w - 16.0);
+        // (The mic and camera icons keep the right end, when they show.)
+        let (l, r) = (b.x + 16.0, b.x + s.w - 16.0 - self.privacy_room());
         match cur {
             0 => {
                 let w = self.time_width(13.5, 700);
@@ -81,7 +82,7 @@ impl App {
             1 => {
                 let st = &self.stats_now;
                 let ram = if st.ram_total > 0 { st.ram_used as f32 / st.ram_total as f32 } else { 0.0 };
-                let half = (s.w - 32.0) / 2.0;
+                let half = (r - l) / 2.0;
                 for (k, (label, v)) in [("CPU", st.cpu), ("RAM", ram)].into_iter().enumerate() {
                     let x = l + k as f32 * (half + 8.0);
                     g.text(label, x, cy, 30.0, 10.5, 500, white(0.5), Align::Start);
@@ -172,6 +173,11 @@ impl App {
 
     /// Notes a new song, for its card (not the first one seen).
     pub(super) fn follow_track(&mut self) {
+        // HILAL_TRACK_PEEK_TEST shows the card once, 7 s after start (for testing).
+        static TESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("HILAL_TRACK_PEEK_TEST").is_some() && self.started_at.elapsed().as_secs() >= 7 && !TESTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.track_peek_until = Some(Instant::now() + TRACK_PEEK);
+        }
         let key = self.track.as_ref().map(|t| format!("{}|{}", t.title, t.artist));
         if key != self.last_track {
             if key.is_some() && self.last_track.is_some() && self.nova() && self.store.features.track_peek && !self.open {
@@ -189,15 +195,18 @@ impl App {
         }
     }
 
-    /// The weather in a page's header, at its right end (Nova mode).
-    pub(super) fn header_weather(&self) {
-        let Some(w) = self.weather.as_ref().filter(|_| self.nova()) else { return };
+    /// The weather in a page's header, at its right end (Nova mode). Returns where the
+    /// header's right end is taken from (by the weather, or the mic and camera badges).
+    pub(super) fn header_weather(&self) -> f32 {
+        let right = 396.0 - self.privacy_room();
+        let Some(w) = self.weather.as_ref().filter(|_| self.nova()) else { return right };
         let g = &self.gfx;
         let temp = format!("{}\u{00b0}", w.temp);
         let tw = g.measure_display(&temp, 12.5, 600);
-        let x = 396.0 - tw;
+        let x = right - tw;
         g.display(&temp, x, 19.0, tw + 2.0, 12.5, 600, white(0.9), Align::Start);
         weather_icon(g, w.sky(), x - 11.0, 19.0, 7.0);
+        x - 24.0
     }
 }
 

@@ -25,6 +25,8 @@ pub enum Event {
     Battery { charging: bool, level: f32 },
     /// The speakers' volume (0..1) and whether they're muted.
     Volume { level: f32, muted: bool },
+    /// The microphone (Windows' default one) muted or not: its first reading too.
+    MicMute(bool),
     /// The screen's brightness (0..100), on screens that have one in software.
     Brightness(u32),
 }
@@ -63,6 +65,9 @@ fn run(tx: Sender<Event>, on: Arc<AtomicBool>) {
     let mut privacy_at = Instant::now() - Duration::from_secs(60);
     let mut wmi = None;
     let mut audio = None;
+    let mut mic: Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume> = None;
+    let mut mic_at = Instant::now() - Duration::from_secs(60);
+    let mut mic_muted: Option<bool> = None;
     let mut was_on = false;
     loop {
         std::thread::sleep(Duration::from_millis(250));
@@ -78,6 +83,7 @@ fn run(tx: Sender<Event>, on: Arc<AtomicBool>) {
             battery = None;
             volume = None;
             bright = None;
+            mic_muted = None;
         }
         let now = Instant::now();
         // The speakers, four times a second (a change shows at once).
@@ -95,6 +101,21 @@ fn run(tx: Sender<Event>, on: Arc<AtomicBool>) {
                 }
                 // The default device changed: look it up again.
                 _ => audio = None,
+            }
+        }
+        // The microphone's mute, four times a second (the default microphone looked up
+        // again every 5 s, in case it changed).
+        if now - mic_at >= Duration::from_secs(5) {
+            mic_at = now;
+            mic = mic_volume();
+        }
+        if let Some(m) = &mic {
+            if let Ok(muted) = unsafe { m.GetMute() } {
+                let muted = muted.as_bool();
+                if mic_muted != Some(muted) {
+                    mic_muted = Some(muted);
+                    let _ = tx.send(Event::MicMute(muted));
+                }
             }
         }
         // Microphone and camera, every 2 s.
@@ -302,6 +323,27 @@ fn endpoint_volume() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioEn
         let e: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
         let dev = e.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
         dev.Activate(CLSCTX_ALL, None).ok()
+    }
+}
+
+/// The default microphone's volume control (its mute is the whole PC's mute for it).
+pub fn mic_volume() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume> {
+    use windows::Win32::Media::Audio::{eCapture, eConsole, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    unsafe {
+        let e: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let dev = e.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        dev.Activate(CLSCTX_ALL, None).ok()
+    }
+}
+
+/// Mutes the default microphone, or turns it back on. The new state, if it worked.
+pub fn toggle_mic() -> Option<bool> {
+    let m = mic_volume()?;
+    unsafe {
+        let muted = m.GetMute().ok()?.as_bool();
+        m.SetMute(!muted, std::ptr::null()).ok()?;
+        Some(!muted)
     }
 }
 

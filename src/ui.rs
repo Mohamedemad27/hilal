@@ -293,6 +293,8 @@ enum Action {
     ToastClick,
     /// Copies a clipboard history item back.
     ClipCopy(usize),
+    /// Mutes or unmutes the microphone (the mic icon on the notch).
+    MicToggle,
     /// The Apps page: open a pinned app, take one off, edit, add.
     AppOpen(usize),
     AppRemove(usize),
@@ -499,6 +501,8 @@ pub struct App {
     region: [i32; 4],
     /// The settled shape the region currently outlines (None while it's the animation box).
     region_shape: Option<Shape>,
+    /// The region took in the mic's wave (standing on a side).
+    region_wave: bool,
     /// When the welcome started, and whether it's a "welcome back".
     welcome_at: Option<(Instant, bool)>,
     /// While a screenshot is being taken: our windows show in the capture (with the glass
@@ -532,6 +536,8 @@ pub struct App {
     reminder_tick: Instant,
     /// The card's shell is still shrinking back (the pages mustn't fade in on the way).
     from_card: Cell<bool>,
+    /// The shape is going to (or coming back from) an open page.
+    from_page: Cell<bool>,
     /// A card just left from under the mouse: no opening until the mouse has moved off.
     hover_blocked: bool,
     /// "Auto" looking up where the PC is (the answer, once it comes).
@@ -853,6 +859,7 @@ impl App {
             closed_sig: String::new(),
             region: [0; 4],
             region_shape: None,
+            region_wave: false,
             welcome_at: None,
             top_check: now,
             water_ask: None,
@@ -868,6 +875,7 @@ impl App {
             reminder_preview: false,
             reminder_tick: now,
             from_card: Cell::new(false),
+            from_page: Cell::new(false),
             hover_blocked: false,
             locating: None,
             locate_at: now - Duration::from_secs(3600),
@@ -1547,7 +1555,9 @@ impl App {
         let notch = self.shape_rect(shape);
         // (Hanging from the top, the screen's very top row counts too.)
         let cy = if self.pos().docked && !self.pos().vertical { self.cursor.1.max(0.0) } else { self.cursor.1 };
-        self.inside = notch.grow(3.0).contains(self.cursor.0, cy);
+        // (Over the mic's wave counts as inside, so the page stays open for a click on it.)
+        let on_wave = self.open && self.wave_rect(shape).is_some_and(|w| w.grow(3.0).contains(self.cursor.0, self.cursor.1));
+        self.inside = notch.grow(3.0).contains(self.cursor.0, cy) || on_wave;
         let near = notch.grow(70.0).contains(self.cursor.0, cy);
         self.follow_linger(near);
         self.follow_drag();
@@ -1573,7 +1583,11 @@ impl App {
             self.hover_blocked = false;
         }
         let toast_click = self.toast_shown() && self.toast.as_ref().is_some_and(|t| t.action.is_some());
-        let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none() && !toast_click;
+        // Resting on the closed notch's mic icon doesn't open it either: a click there mutes
+        // or unmutes the microphone.
+        // (A little around it too, as the mouse comes to it over the notch's edge.)
+        let on_mic = !self.open && self.regions.borrow().iter().any(|(r, a)| *a == Action::MicToggle && r.grow(8.0).contains(self.cursor.0, self.cursor.1));
+        let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none() && !toast_click && !on_mic;
         if hover_opens || self.form.is_some() || alerting || self.pinned || self.city_picker.shown {
             if !self.open {
                 trace(&format!("[open] hover {} rested {:?} over maximized {} form {} alert {}", hover_opens, self.hover_since.map(|t| (now - t).as_millis()), self.over_maximized, self.form.is_some(), alerting));
@@ -1928,9 +1942,11 @@ impl App {
         let k = self.gfx.scale;
         let b = self.shape_rect(s);
         let e = if self.shape_radii(s).is_none() { s.e } else { 0.0 };
+        // (Standing on a side, the mic's wave rises above the shape: the region takes it in.)
+        let wave_top = [self.wave_rect(cur), self.wave_rect(self.anim.to)].into_iter().flatten().map(|w| w.y - 2.0).fold(b.y, f32::min);
         let r = [
             ((b.x - e) * k).floor().max(0.0) as i32,
-            (b.y * k).floor().max(0.0) as i32,
+            (wave_top * k).floor().max(0.0) as i32,
             ((b.x + b.w + e) * k).ceil().min(WIN_W * k) as i32,
             ((b.y + b.h) * k).ceil().min(WIN_H * k) as i32 + 1,
         ];
@@ -1938,14 +1954,25 @@ impl App {
             // At rest the region is the notch's exact outline. Besides clicks, it's what
             // a screenshot tool that can't see us paints black, so that comes out as a
             // plain black notch rather than a box.
-            if self.region_shape != Some(cur) {
+            let wave = self.wave_points(cur);
+            if self.region_shape != Some(cur) || self.region_wave != !wave.is_empty() {
                 self.region_shape = Some(cur);
+                self.region_wave = !wave.is_empty();
                 self.region = r;
                 let b = self.shape_rect(cur);
                 let rgn = match self.shape_radii(cur) {
                     None => notch_region(cur, b.x + b.w / 2.0, k),
                     Some(radii) => slab_region(b, radii, k),
                 };
+                if !wave.is_empty() {
+                    use windows::Win32::Graphics::Gdi::{CombineRgn, CreatePolygonRgn, DeleteObject, RGN_OR, WINDING};
+                    let pts: Vec<POINT> = wave.iter().map(|&(x, y)| POINT { x: (x * k).round() as i32, y: ((b.y + y - if y < 0.0 { 2.0 } else { 0.0 }) * k).round() as i32 }).collect();
+                    unsafe {
+                        let w = CreatePolygonRgn(&pts, WINDING);
+                        CombineRgn(rgn, rgn, w, RGN_OR);
+                        let _ = DeleteObject(w);
+                    }
+                }
                 unsafe {
                     SetWindowRgn(self.hwnd, rgn, false);
                 }
@@ -2111,7 +2138,7 @@ impl App {
     fn closed_signature(&self) -> String {
         // (On a side it also shows the CPU and memory load.)
         let stats = if self.pos().vertical { (self.stats_now.cpu * 100.0).round() as i32 * 1000 + self.ram_pct() } else { 0 };
-        let dots = (self.watched.mic.len(), self.watched.cam.len());
+        let dots = (self.watched.mic.len(), self.watched.cam.len(), self.watched.mic_muted);
         // Nova's slides: which shows, and (for the CPU and memory) their load.
         let slide = if self.nova_idle() {
             let t = self.slides_at.elapsed().as_secs_f32();
@@ -2347,8 +2374,7 @@ impl App {
     }
 
     pub fn mouse_down(&mut self, x: f32, y: f32) {
-        self.pressed = self.region_at(x, y).map(|a| (a, x, y));
-        // Away from the buttons a press may become a drag (once it moves).
+        self.pressed = self.region_at(x, y).map(|a| (a, x, y));        // Away from the buttons a press may become a drag (once it moves).
         if self.pressed.is_none() && self.form.is_none() && self.nova() {
             self.press_drag = win::cursor_px();
         }
@@ -2378,7 +2404,8 @@ impl App {
             up.get_or_insert_with(Instant::now);
         }
         let Some((a, _, _)) = self.pressed.take() else { return };
-        if self.region_at(x, y) == Some(a) {
+        // (The mic icon moves as the notch opens under the click: a press on it is enough.)
+        if self.region_at(x, y) == Some(a) || a == Action::MicToggle {
             self.perform(a, x);
             self.draw();
         }
@@ -2607,6 +2634,10 @@ impl App {
             }
             ClipCopy(i) => {
                 self.clip_copy(i);
+                save = false;
+            }
+            MicToggle => {
+                self.mic_toggle();
                 save = false;
             }
             AppOpen(i) => {
@@ -2875,7 +2906,14 @@ impl App {
         }
         // (Standing on a side, the closed notch is tall and narrow: width tells the states apart.)
         let grown = if vertical { ((s.w - 200.0) / 150.0).clamp(0.0, 1.0) } else { ((s.h - 70.0) / 50.0).clamp(0.0, 1.0) };
-        let open_a = if self.from_card.get() { 0.0 } else { grown };
+        // A page shows only on the way to (or back from) the open notch: a peek, card or toast
+        // as wide as a page (standing on a side, width is what tells them apart) is no page.
+        if self.anim.to == PAGE || self.anim.to == WIDE {
+            self.from_page.set(true);
+        } else if !self.open && (self.anim.to == PEEK || self.anim.to == toasts::TOAST || self.anim.to == toasts::V_TOAST || self.reminder.is_some()) {
+            self.from_page.set(false);
+        }
+        let open_a = if self.from_card.get() || !self.from_page.get() { 0.0 } else { grown };
         let closed_a = if vertical { ((90.0 - s.w) / 30.0).clamp(0.0, 1.0) } else { ((44.0 - s.h) / 12.0).clamp(0.0, 1.0) };
         let peek_a = |full: f32| if vertical { ((s.w - 100.0) / 120.0).clamp(0.0, 1.0) } else { ((s.h - 34.0) / full).clamp(0.0, 1.0) };
         if open_a > 0.0 {
@@ -2936,9 +2974,10 @@ impl App {
         }
         self.ox.set(0.0);
         g.offset(0.0);
+        // (Standing on a side, the badges' wave rises above the shape: not clipped.)
+        g.unclip();
         self.privacy_dots(s);
         g.offset(0.0);
-        g.unclip();
         if self.confetti_up() {
             g.set_dy(0.0);
             self.confetti_view();
@@ -3180,7 +3219,9 @@ impl App {
 
     // ----- shared chrome ----------------------------------------------------------------
 
-    fn header(&self, title: &str, accent: Option<(&str, Color)>) {
+    /// A page's header: its title, the date and time in the middle, the weather at the right.
+    /// Returns where the free room on the right ends (before the weather).
+    fn header(&self, title: &str, accent: Option<(&str, Color)>) -> f32 {
         let g = &self.gfx;
         if !title.is_empty() {
             g.text(title, 15.0, 19.0, 200.0, 15.0, 600, WHITE, Align::Start);
@@ -3190,7 +3231,7 @@ impl App {
             }
         }
         self.clock_group(216.0, 19.0);
-        self.header_weather();
+        self.header_weather()
     }
 
     /// The time the iOS way: digits in the display face, AM/PM smaller and dimmer beside
@@ -3326,6 +3367,14 @@ impl App {
 
     fn closed(&self, s: Shape) {
         if self.pos().vertical {
+            // The mic and camera badges take the column's top: what it shows moves down.
+            if self.privacy_shown() {
+                let y = self.shape_rect(s).y;
+                self.gfx.set_dy(y + 13.0);
+                self.closed_side(s);
+                self.gfx.set_dy(y);
+                return;
+            }
             return self.closed_side(s);
         }
         let g = &self.gfx;
@@ -3345,18 +3394,20 @@ impl App {
             } else {
                 g.fill_rrect(art, 5.0, white(0.15));
             }
-            self.bars(x0 + s.w - 31.0, cy, &lv, accent);
+            // (The mic and camera icons keep the right end, when they show.)
+            let room = self.privacy_room();
+            self.bars(x0 + s.w - 31.0 - room, cy, &lv, accent);
             if let Some(line) = line {
-                g.text(&line, x0 + 38.0, cy, s.w - 76.0, 13.0, 600, WHITE, Align::Center);
+                g.text(&line, x0 + 38.0, cy, s.w - 76.0 - room, 13.0, 600, WHITE, Align::Center);
             } else if s.w > IDLE.w + 20.0 {
-                g.text(&t.title, x0 + 38.0, cy, s.w - 76.0, 12.0, 600, white(0.85), Align::Center);
+                g.text(&t.title, x0 + 38.0, cy, s.w - 76.0 - room, 12.0, 600, white(0.85), Align::Center);
             }
         } else if self.pomo.running() {
             let left = self.pomo.remaining();
             let frac = left.as_secs_f32() / Pomo::total(self.pomo.brk).as_secs_f32();
             g.stroke_circle(x0 + 20.0, cy, 6.0, 2.2, rgba(0xff, 0x4b, 0x55, 0.3));
             g.arc(x0 + 20.0, cy, 6.0, 0.0, frac * 360.0, 2.2, RED);
-            g.text(&mmss(left.as_millis() as i64), x0 + s.w - 70.0, cy, 56.0, 13.0, 600, WHITE, Align::End);
+            g.text(&mmss(left.as_millis() as i64), x0 + s.w - 70.0 - self.privacy_room(), cy, 56.0, 13.0, 600, WHITE, Align::End);
         } else if self.nova_idle() && self.eyes_shown() {
             self.eyes_view(s);
         } else if self.nova_idle() {
@@ -4075,12 +4126,23 @@ impl App {
 
     fn claude_page(&self) {
         let g = &self.gfx;
-        self.header("Claude ", Some(("Code", CLAUDE)));
+        let end = self.header("Claude ", Some(("Code", CLAUDE)));
         let list = &self.claude_list;
         let working = list.iter().filter(|s| s.state == claude::State::Working).count();
         if working > 0 {
+            // Before the weather, after the clock (it ends near 292): "2 working", or where
+            // that doesn't fit, a little spinner and the number.
             let label = format!("{working} working");
-            g.text(&label, 300.0, 19.0, 84.0, 10.5, 600, CLAUDE, Align::End);
+            let lw = g.measure(&label, 10.5, 600);
+            if end - lw >= 294.0 {
+                g.text(&label, end - lw, 19.0, lw + 2.0, 10.5, 600, CLAUDE, Align::Start);
+            } else {
+                let n = working.to_string();
+                let nw = g.measure(&n, 10.5, 700);
+                g.text(&n, end - nw, 19.0, nw + 2.0, 10.5, 700, CLAUDE, Align::Start);
+                let t = self.t0.elapsed().as_secs_f32();
+                g.arc(end - nw - 7.0, 19.0, 3.8, (t * 360.0) % 360.0, 260.0, 1.5, CLAUDE);
+            }
         }
         if list.is_empty() {
             spark(g, 210.0, 66.0, 13.0, white(0.3), 0.0);

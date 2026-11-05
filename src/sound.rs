@@ -74,6 +74,18 @@ const PRAYER: [Voice; 6] = [
     (0.76, 1046.50, 1046.50, 0.0, 0.26, 0.06),
 ];
 
+/// The microphone turned on: two quick soft tones stepping up (A5, E6). Muted: the same
+/// stepping down. A quarter of a second, quieter than the chimes.
+const MIC_LEN_S: f32 = 0.28;
+const MIC_ON: [Voice; 2] = [
+    (0.00, 880.0, 880.0, 0.0, 0.045, 0.26),
+    (0.08, 1318.51, 1318.51, 0.0, 0.07, 0.26),
+];
+const MIC_OFF: [Voice; 2] = [
+    (0.00, 1318.51, 1318.51, 0.0, 0.045, 0.26),
+    (0.08, 880.0, 880.0, 0.0, 0.07, 0.26),
+];
+
 fn chime() -> &'static [u8] {
     static WAV: OnceLock<Vec<u8>> = OnceLock::new();
     WAV.get_or_init(|| synth(&WATER, LEN_S))
@@ -130,6 +142,17 @@ fn synth(voices: &[Voice], len_s: f32) -> Vec<u8> {
 /// Plays the water chime without waiting for it.
 pub fn play_chime() {
     play(chime(), "chime");
+}
+
+/// Plays the microphone's sound: muted (stepping down) or back on (stepping up).
+pub fn play_mic(muted: bool) {
+    static ON: OnceLock<Vec<u8>> = OnceLock::new();
+    static OFF: OnceLock<Vec<u8>> = OnceLock::new();
+    if muted {
+        play(OFF.get_or_init(|| synth(&MIC_OFF, MIC_LEN_S)), "mic off");
+    } else {
+        play(ON.get_or_init(|| synth(&MIC_ON, MIC_LEN_S)), "mic on");
+    }
 }
 
 /// Plays the chosen adhan, or else the prayer chime, without waiting for it.

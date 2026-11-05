@@ -16,8 +16,32 @@ use crate::watch::{self, Event, Link};
 pub const TOAST: Shape = Shape { w: 340.0, h: 34.0, r: 17.0, e: 12.0 };
 pub const V_TOAST: Shape = Shape { w: 44.0, h: 168.0, r: 22.0, e: 0.0 };
 
-const MIC: Color = rgb(0xff, 0x9f, 0x0a);
+const MIC: Color = rgb(0x30, 0xd1, 0x58);
+const MIC_OFF: Color = rgb(0xff, 0x45, 0x3a);
 const CAM: Color = rgb(0x30, 0xd1, 0x58);
+/// From one of the mic and camera badges to the next.
+const PRIVACY_STEP: f32 = 20.0;
+/// Standing on a side, the badges ride in a bubble welling up from the shape's top edge:
+/// its radius, how far its middle stands above the edge, and the radius of the curves
+/// that join it to the edge (the neck).
+const BUB_R: f32 = 12.5;
+const BUB_D: f32 = 16.0;
+const BUB_F: f32 = 8.0;
+
+/// A microphone drawn in lines (`k` about half its height), struck through when muted.
+fn mic_glyph(g: &crate::gfx::Gfx, x: f32, y: f32, k: f32, c: Color, muted: bool) {
+    let w = (k * 0.24).max(1.2);
+    let y = y + k * 0.05;
+    g.fill_rrect(Rect::new(x - k * 0.34, y - k, k * 0.68, k * 1.15), k * 0.34, c);
+    g.arc(x, y - k * 0.2, k * 0.62, 90.0, 180.0, w, c);
+    g.line(x, y + k * 0.42, x, y + k * 0.78, w, c);
+    g.line(x - k * 0.38, y + k * 0.8, x + k * 0.38, y + k * 0.8, w, c);
+    if muted {
+        // A dark cut under the slash keeps it clear of the mic.
+        g.line(x - k * 0.85, y - k * 0.9, x + k * 0.85, y + k * 0.8, w * 2.6, [0.0, 0.0, 0.0, 1.0]);
+        g.line(x - k * 0.85, y - k * 0.9, x + k * 0.85, y + k * 0.8, w, c);
+    }
+}
 
 /// What a click on a toast does.
 #[derive(Clone)]
@@ -52,6 +76,10 @@ pub struct Watched {
     pub watch: watch::Watch,
     pub mic: Vec<String>,
     pub cam: Vec<String>,
+    /// The microphone muted in Windows.
+    pub mic_muted: bool,
+    /// The apps on the mic and camera have been read once.
+    pub privacy_read: bool,
     pub link: Link,
     pub internet: Option<bool>,
     down_at: Option<Instant>,
@@ -74,6 +102,8 @@ impl Watched {
             watch: watch::Watch::start(on),
             mic: Vec::new(),
             cam: Vec::new(),
+            mic_muted: false,
+            privacy_read: false,
             link: Link::None,
             internet: None,
             down_at: None,
@@ -167,7 +197,10 @@ impl App {
                 // A toast only for apps that just started.
                 let new_cam: Vec<String> = cam.iter().filter(|a| !self.watched.cam.contains(a)).cloned().collect();
                 let new_mic: Vec<String> = mic.iter().filter(|a| !self.watched.mic.contains(a)).cloned().collect();
-                if privacy {
+                // (None for the first reading: those apps were at it before Hilal started, and
+                // it would land on the welcome. Nor over the welcome at all.)
+                let first = !std::mem::replace(&mut self.watched.privacy_read, true);
+                if privacy && !first && !self.welcoming() {
                     if !new_cam.is_empty() {
                         self.toast('\u{E714}', CAM, format!("{} is using the camera", new_cam.join(", ")), "", None, 3200);
                     } else if !new_mic.is_empty() {
@@ -232,6 +265,14 @@ impl App {
                     let value = if muted { "Muted".to_owned() } else { format!("{}%", (level * 100.0).round()) };
                     self.toast(icon, WHITE, "", value, Some(if muted { 0.0 } else { level }), 1600);
                 }
+            }
+            Event::MicMute(muted) => {
+                // (HILAL_MIC_DRY keeps the test's own pretend state.)
+                if std::env::var_os("HILAL_MIC_DRY").is_some() {
+                    return;
+                }
+                self.watched.mic_muted = muted;
+                self.closed_sig.clear();
             }
             Event::Brightness(b) => {
                 if bright && !self.open {
@@ -471,8 +512,8 @@ impl App {
             g.icon(t.icon, x0 + 24.0, cy, 14.0, t.color);
             lx = x0 + 42.0;
         }
-        let right = x0 + s.w - 16.0;
-        let vw = if t.value.is_empty() { 0.0 } else { g.measure(&t.value, 12.0, 600) + 4.0 };
+        let right = x0 + s.w - 16.0 - self.privacy_room();
+        let vw =if t.value.is_empty() { 0.0 } else { g.measure(&t.value, 12.0, 600) + 4.0 };
         let vc = if t.action.is_some() { rgb(0x9c, 0xc3, 0xff) } else { white(0.75) };
         match t.bar {
             Some(k) if t.label.is_empty() => {
@@ -553,26 +594,189 @@ impl App {
         }
     }
 
-    /// The mic and camera dots, on the notch in any shape.
+    /// How much of the notch's right end the mic and camera icons keep (lying flat), so what
+    /// shows there moves aside for them.
+    pub(super) fn privacy_room(&self) -> f32 {
+        if self.pos().vertical {
+            0.0
+        } else {
+            self.privacy_count() as f32 * PRIVACY_STEP
+        }
+    }
+
+    /// Whether the mic or camera badge shows.
+    pub(super) fn privacy_shown(&self) -> bool {
+        self.privacy_count() > 0
+    }
+
+    /// How many of the mic and camera badges show.
+    fn privacy_count(&self) -> usize {
+        // (Not over a reminder card, a duaa, the azkar, the water; nor the welcome.)
+        // Nor over a toast with its own mic or camera ("Discord is using the microphone"),
+        // nor over any toast standing on a side, where the toast's icon would sit right under it.
+        let toast_icon = self.toast_shown() && (self.pos().vertical || self.toast.as_ref().is_some_and(|t| matches!(t.icon, '\u{E720}' | '\u{E714}')));
+        if !self.nova() || !self.store.features.privacy_dots || (self.reminder.is_some() && !self.open) || self.welcoming() || toast_icon {
+            return 0;
+        }
+        !self.watched.mic.is_empty() as usize + !self.watched.cam.is_empty() as usize
+    }
+
+    /// Standing on a side, a wide shape (a page, a card) carries the badges in a wave rising
+    /// from its top edge: how far it has risen (0 to 1), from how wide the shape has grown.
+    pub(super) fn wave_k(&self, s: Shape) -> f32 {
+        if !self.pos().vertical || self.privacy_count() == 0 {
+            return 0.0;
+        }
+        ((s.w - 200.0) / 150.0).clamp(0.0, 1.0)
+    }
+
+    /// The wave's outline, from its left foot over the top to its right foot: x in the
+    /// window, y up from the shape's top edge (so negative). Empty while it's down.
+    pub(super) fn wave_points(&self, s: Shape) -> Vec<(f32, f32)> {
+        let k = self.wave_k(s);
+        if k <= 0.0 {
+            return Vec::new();
+        }
+        let (cx, half_len) = self.bubble_at(s);
+        let (r, d, f) = (BUB_R * k, BUB_D * k, BUB_F * k);
+        // The left half: from the edge up the neck's curve (a circle of radius f, outside
+        // the shape, touching both the edge and the bubble), then round the bubble's end to
+        // its top. The right half mirrors it.
+        let a = ((r + f).powi(2) - (d - f).powi(2)).max(0.0).sqrt();
+        let (lc, fc) = ((cx - half_len, -d), (cx - half_len - a, -f));
+        let mut left = vec![(fc.0, 0.0)];
+        let to_bubble = (lc.1 - fc.1).atan2(lc.0 - fc.0);
+        for i in 0..=10 {
+            let t = std::f32::consts::FRAC_PI_2 + (to_bubble - std::f32::consts::FRAC_PI_2) * i as f32 / 10.0;
+            left.push((fc.0 + f * t.cos(), fc.1 + f * t.sin()));
+        }
+        let from = (fc.1 - lc.1).atan2(fc.0 - lc.0);
+        let from = if from < 0.0 { from + std::f32::consts::TAU } else { from };
+        let top = 1.5 * std::f32::consts::PI;
+        for i in 1..=16 {
+            let t = from + (top - from) * i as f32 / 16.0;
+            left.push((lc.0 + r * t.cos(), lc.1 + r * t.sin()));
+        }
+        let mut pts = left.clone();
+        pts.extend(left.iter().rev().map(|&(x, y)| (2.0 * cx - x, y)));
+        pts.push((cx + half_len + a, 2.0));
+        pts.push((cx - half_len - a, 2.0));
+        pts
+    }
+
+    /// Where the bubble stands: its middle's x, and half the length of its straight top
+    /// (none for one badge, a capsule for two).
+    fn bubble_at(&self, s: Shape) -> (f32, f32) {
+        let b = self.shape_rect(s);
+        (b.x + b.w / 2.0, (self.privacy_count() as f32 - 1.0).max(0.0) * PRIVACY_STEP / 2.0)
+    }
+
+    /// The bubble's box in the window (for the mouse), while it's up.
+    pub(super) fn wave_rect(&self, s: Shape) -> Option<Rect> {
+        let pts = self.wave_points(s);
+        let (l, r) = pts.iter().fold((f32::MAX, f32::MIN), |(l, r), p| (l.min(p.0), r.max(p.0)));
+        let top = pts.iter().map(|p| p.1).fold(0.0, f32::min);
+        let b = self.shape_rect(s);
+        (l < r).then(|| Rect::new(l, b.y + top, r - l, -top))
+    }
+
+    /// The mic and camera in use, on the notch in any shape: a microphone (green; red and
+    /// struck through while it's muted in Windows, and a click mutes or unmutes it) and a
+    /// camera (green). Standing on a side, a page or card carries them in a wave on its top.
     pub(super) fn privacy_dots(&self, s: Shape) {
-        if !self.nova() || !self.store.features.privacy_dots || (self.watched.mic.is_empty() && self.watched.cam.is_empty()) {
+        if self.privacy_count() == 0 {
             return;
         }
         let g = &self.gfx;
         g.fade.set(1.0);
         let b = self.shape_rect(s);
-        let dots: Vec<Color> = [(!self.watched.mic.is_empty(), MIC), (!self.watched.cam.is_empty(), CAM)].into_iter().filter(|d| d.0).map(|d| d.1).collect();
-        let big = s.h > 50.0;
-        let (mut x, y) = if self.pos().vertical {
-            (b.x + b.w / 2.0 - (dots.len() as f32 - 1.0) * 5.0, 10.0)
-        } else {
-            (b.x + b.w - if big { 26.0 } else { 15.0 } - (dots.len() as f32 - 1.0) * 10.0, if big { 12.0 } else { 7.0 })
-        };
-        for c in dots {
-            g.radial(x, y, 6.0, 6.0, [c[0], c[1], c[2], 0.5]);
-            g.fill_circle(x, y, 3.0, c);
-            x += 10.0;
+        let wave = self.wave_k(s);
+        if wave > 0.0 {
+            let c = if self.glass_live || self.theme().is_some() { [0.0, 0.0, 0.0, 0.7] } else { [0.0, 0.0, 0.0, 1.0] };
+            g.fill_poly(&self.wave_points(s), c);
+            // Liquid glass: a soft sheen in its upper half and light caught along its rim.
+            let (cx, l) = self.bubble_at(s);
+            let (r, d) = (BUB_R * wave, BUB_D * wave);
+            g.radial(cx, -d - r * 0.4, (r + l) * 0.75, r * 0.45, white(0.07 * wave));
+            let rim = white(0.30 * wave);
+            g.arc(cx - l, -d, r - 0.8, 285.0, 75.0, 1.1, rim);
+            g.arc(cx + l, -d, r - 0.8, 0.0, 75.0, 1.1, rim);
+            if l > 0.0 {
+                g.line(cx - l, -d - r + 0.8, cx + l, -d - r + 0.8, 1.1, rim);
+            }
         }
+        let icons: Vec<(char, Color, bool)> = [
+            (!self.watched.mic.is_empty(), '\u{E720}', MIC, true),
+            (!self.watched.cam.is_empty(), '\u{E714}', CAM, false),
+        ]
+        .into_iter()
+        .filter(|i| i.0)
+        .map(|i| (i.1, i.2, i.3))
+        .collect();
+        let step = PRIVACY_STEP;
+        let back = (icons.len() as f32 - 1.0) * step;
+        // At the right end: of the closed notch and toasts (in line with what they show, which
+        // makes room), of an open page (in line with its header), of a card (in its corner).
+        // `r` is the badge's radius.
+        let (mut x, y, r) = if self.pos().vertical {
+            // Inside the closed column's top, rising into the bubble as the shape widens.
+            let up = -BUB_D;
+            (b.x + b.w / 2.0 - back / 2.0, 12.0 + (up - 12.0) * wave, 8.0 + 0.5 * wave)
+        } else if s.h <= 40.0 {
+            (b.x + b.w - 17.0 - back, s.h / 2.0, 8.5)
+        } else if self.open {
+            (b.x + b.w - 28.0 - back, 19.0, 9.5)
+        } else {
+            (b.x + b.w - 16.0 - back, 11.0, 7.5)
+        };
+        for (glyph, c, is_mic) in icons {
+            // The microphone: green while it's on, red and struck through while it's muted.
+            let c = match (is_mic, self.watched.mic_muted) {
+                (true, true) => MIC_OFF,
+                (true, false) => MIC,
+                _ => c,
+            };
+            g.fill_circle(x, y, r, [c[0], c[1], c[2], 0.2]);
+            if is_mic {
+                mic_glyph(g, x, y, r * 0.62, c, self.watched.mic_muted);
+            } else {
+                g.icon(glyph, x, y, r * 1.05, c);
+            }
+            if is_mic {
+                // (The click works in the notch's own coordinates, whatever the view's: a
+                // view may have moved them, as the closed column does.)
+                let r = Rect::centered(x, y, r * 2.0 + 2.0, r * 2.0 + 2.0);
+                let (ox, oy) = (self.ox.get(), self.oy.get());
+                self.ox.set(0.0);
+                self.oy.set(b.y);
+                self.hit(r, super::Action::MicToggle);
+                self.ox.set(ox);
+                self.oy.set(oy);
+            }
+            x += step;
+        }
+    }
+
+    /// Mutes the microphone in Windows, or turns it back on.
+    pub(super) fn mic_toggle(&mut self) {
+        // HILAL_MIC_DRY: the click is only noted, the microphone untouched (for testing).
+        let done = if std::env::var_os("HILAL_MIC_DRY").is_some() {
+            super::trace("[mic] a click would mute or unmute the microphone");
+            Some(!self.watched.mic_muted)
+        } else {
+            watch::toggle_mic()
+        };
+        match done {
+            Some(muted) => {
+                self.watched.mic_muted = muted;
+                super::trace(&format!("[mic] now muted {muted}"));
+                // The badge's color and a sound say it: no toast (one would hide the badge,
+                // or stand its own mic beside it).
+                crate::sound::play_mic(muted);
+            }
+            None => self.toast('\u{E720}', RED, "No microphone found", "", None, 2500),
+        }
+        self.closed_sig.clear();
     }
 
     /// The apps using the microphone and camera now (for the System page).

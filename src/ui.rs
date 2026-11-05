@@ -23,9 +23,11 @@ use crate::reminders_data::REMINDERS;
 
 mod settings;
 mod apps_page;
+mod city_picker;
 mod companion;
 mod dl_options;
 pub use dl_options::{After as DlAfter, DW_H, DW_W};
+pub use city_picker::{CP_H, CP_W};
 mod extras;
 mod folder_downloads;
 mod meetings;
@@ -304,6 +306,8 @@ enum Action {
     RadioVolume(f32),
     /// Step through the prayer cities by this much.
     PrayerCity(i32),
+    /// Opens the city drop-down under the pill (its place).
+    PrayerPick(f32, f32, f32, f32),
     PrayerAlerts,
     PrayerDismiss,
     /// Take the link from the clipboard.
@@ -541,6 +545,8 @@ pub struct App {
     /// The format the last download was asked in ("MP3", "WEBM", ...), and the options window.
     dl_format: String,
     dl_win: dl_options::DlWin,
+    /// The prayer city's drop-down.
+    city_picker: city_picker::CityPicker,
     dl_job: Option<download::Job>,
     /// A paste with no link on the clipboard, shown as a hint for a moment.
     dl_no_link_at: Option<Instant>,
@@ -870,6 +876,7 @@ impl App {
             dl_kind: Kind::Mp4,
             dl_format: String::new(),
             dl_win: dl_options::DlWin::new(),
+            city_picker: city_picker::CityPicker::new(),
             dl_job: None,
             dl_no_link_at: None,
             capture_until: None,
@@ -1471,6 +1478,11 @@ impl App {
         }
         self.tick_settings();
         self.tick_dl();
+        self.tick_city_picker();
+        // (The list goes when the notch closes or leaves the prayer page.)
+        if self.city_picker.shown && (!self.open || self.page != Page::Prayer) {
+            self.close_city_picker();
+        }
         self.tick_toasts();
         self.tick_apps();
         self.tick_meetings();
@@ -1559,7 +1571,7 @@ impl App {
         }
         let toast_click = self.toast_shown() && self.toast.as_ref().is_some_and(|t| t.action.is_some());
         let hover_opens = self.inside && rested && (!self.peeking() || self.open) && !self.hover_blocked && self.drag.is_none() && !toast_click;
-        if hover_opens || self.form.is_some() || alerting || self.pinned {
+        if hover_opens || self.form.is_some() || alerting || self.pinned || self.city_picker.shown {
             if !self.open {
                 trace(&format!("[open] hover {} rested {:?} over maximized {} form {} alert {}", hover_opens, self.hover_since.map(|t| (now - t).as_millis()), self.over_maximized, self.form.is_some(), alerting));
             }
@@ -2517,6 +2529,10 @@ impl App {
                 if below && w.drunk_ml >= w.goal_ml {
                     self.celebrate(&[rgb(0x40, 0xc8, 0xff), rgb(0x30, 0xd1, 0x58), WHITE]);
                 }
+            }
+            PrayerPick(x, y, w, h) => {
+                self.open_city_picker(Rect::new(x, y, w, h));
+                save = false;
             }
             PrayerCity(d) => {
                 let n = self.prayer_choices() as i32;
@@ -4012,7 +4028,7 @@ impl App {
         }
         let pin = Ico::Glyph('\u{E81D}');
         let cw = self.pill_w(pin, city).min(152.0 - 34.0 - 6.0);
-        self.pill(Rect::new(44.0, 99.0, cw, 24.0), white(0.12), pin, city, WHITE, Some(Action::PrayerCity(1)));
+        self.pill(Rect::new(44.0, 99.0, cw, 24.0), white(0.12), pin, city, WHITE, Some(Action::PrayerPick(44.0, 99.0, cw, 24.0)));
         // The bell: an alert at each prayer time, on or off.
         let on = self.store.prayer.alerts;
         let bell = Ico::Glyph(if on { '\u{EA8F}' } else { '\u{E7ED}' });

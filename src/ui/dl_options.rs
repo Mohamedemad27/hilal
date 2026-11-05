@@ -446,6 +446,9 @@ impl App {
         g.text("Download", go.x + 32.0, by + 15.0, go.w - 40.0, 12.5, 600, WHITE, Align::Center);
         hit(go, Do::Download);
         g.text("Enter downloads", 20.0, by + 15.0, cancel.x - 30.0, 10.0, 400, white(0.35), Align::Start);
-        let _ = self.gfx.present();
+        // A skipped frame (the screen wasn't ready) is drawn again next time round.
+        if self.gfx.present().is_err() {
+            self.dl_win.redraw_until = Some(Instant::now() + std::time::Duration::from_millis(100));
+        }
     }
 }

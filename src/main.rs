@@ -43,7 +43,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use ui::{App, DW_H, DW_W, OV_W, SW_H, SW_W, WAKE_H, WIN_H, WIN_W};
+use ui::{App, CP_H, CP_W, DW_H, DW_W, OV_W, SW_H, SW_W, WAKE_H, WIN_H, WIN_W};
 
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted by the mouse hook when the cursor nears the notch; it only wakes the loop.
@@ -795,6 +795,82 @@ pub fn set_hotkey(on: bool) {
             ui::trace("[hotkey] Ctrl+Alt+H is taken by another app");
         }
     }
+}
+
+/// Creates the prayer city's drop-down (hidden; the app places, fills and shows it).
+pub fn create_city_window() -> Option<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(city_proc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).ok()?,
+            lpszClassName: w!("HilalCities"),
+            ..Default::default()
+        };
+        RegisterClassExW(&class);
+        CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            w!("HilalCities"),
+            w!("Hilal Cities"),
+            WS_POPUP,
+            0,
+            0,
+            CP_W as i32,
+            CP_H as i32,
+            None,
+            None,
+            instance,
+            None,
+        )
+        .ok()
+    }
+}
+
+extern "system" fn city_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+    match msg {
+        WM_MOUSEMOVE => {
+            let (x, y) = dp(hwnd, lparam);
+            let mut track = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
+                dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut track);
+            }
+            with_app(|a| a.city_hover(x, y));
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            with_app(|a| a.city_hover(-1.0, -1.0));
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = dp(hwnd, lparam);
+            with_app(|a| a.city_click(x, y));
+            return LRESULT(0);
+        }
+        WM_MOUSEWHEEL => {
+            with_app(|a| a.city_wheel(((wparam.0 >> 16) & 0xffff) as i16 as i32));
+            return LRESULT(0);
+        }
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wparam.0 as u32) {
+                with_app(|a| a.city_char(c));
+            }
+            return LRESULT(0);
+        }
+        // A click anywhere else closes it.
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|a| a.close_city_picker());
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// Creates the download options window (hidden; the app places, fills and shows it).

@@ -1,6 +1,6 @@
 [package]
 name = "hilal"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "A notch for the top of your Windows screen: music, lyrics, focus timer, water, shelf, to-do."
 

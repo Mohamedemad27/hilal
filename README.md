@@ -20,21 +20,22 @@
 
 Hilal sits at the top center of the screen. Closed, it's a small pill (or just a thin line). Hover it
 and it springs open into pages you flip through with the arrows, the dots, the mouse wheel or the
-arrow keys. **Drag it** anywhere you like: dropped near the top edge it docks there (snapping to the
-middle), anywhere else it floats, and in **vertical mode** it stands on the left or right edge of
-the screen as a slim capsule with the time, the day, CPU and memory load and the next prayer.
+arrow keys.
 
 **While closed** it shows the time (12- or 24-hour, following Windows), and whatever is going on:
 the song playing, with bars that move with the actual sound in the cover's color, the current lyric
 line, or a running focus timer. Reminders peek out on their own.
 
+It comes in two styles, switched in Settings: **Classic Hilal**, described first below, and
+**Nova**, which adds a lot more (see [Nova mode](#nova-mode)).
+
 | Page | What's on it |
 |---|---|
-| **Music** | What's playing in any app that reports to Windows' media controls (Spotify, browsers, players): cover, title, progress, play/pause/skip, and **synced lyrics** in a wide view. |
+| **Music** | What's playing in any app that reports to Windows' media controls (Spotify, browsers, players): cover, title, progress, play/pause/skip, and **lyrics** in a wide view: synced, line by line with the song, or, when the lyrics library has only the words, those to read and scroll. |
 | **Pomodoro** | Focus and short-break timers. |
 | **Water Reminder** | A daily goal split into reminders through your waking hours; tracks your bottle and refills, with snooze. |
-| **Prayer Times** | The five daily prayers for 33 Egyptian cities and 44 more around the world, or **wherever you are** (found from your internet address), worked out on the device with each country's own method (Egyptian Survey, Umm al-Qura, Dubai, Diyanet, ISNA and more) and shown in the place's own time zone, like a mosque timetable. The Hijri date (adjustable by a day or two for a local moon sighting), Asr by the Hanafi rule if you like, a countdown to the next prayer, a short heads-up 10 minutes before, a Ramadan countdown to iftar and imsak, and an alert at each prayer that can play an **adhan recording of your choice**. |
-| **Video Download** | Paste a link, pick **MP3** or **MP4**, download (YouTube and the many other sites yt-dlp supports). Before it starts, a small window lets you choose video or sound only, the format (MP4, MKV, WEBM, MP3, M4A, OPUS, WAV) and the quality (only what the video has), rename the file, and set the artist and album written into it. |
+| **Prayer Times** | The five daily prayers for 33 Egyptian cities, worked out on the device with the Egyptian Survey's method (they match Google's and the Egyptian tables), a countdown to the next prayer, and an alert at each prayer that can play an **adhan recording of your choice**. |
+| **Video Download** | Paste a link and download a video or its sound (YouTube and the many other sites yt-dlp supports). Before it starts, a small window lets you choose video or audio only, the format (MP4, MKV, WEBM, MP3, M4A, OPUS, WAV) and the quality (only what the video has), rename the file, and set the artist and album written into it. |
 | **Claude Code** | Your recent [Claude Code](https://claude.com/claude-code) sessions: which are working, waiting for you, done or stopped, and their task progress. Click one for a glass popup with its tasks and latest exchange, and a box to send it a message (pasted into the Claude app, for you to send). |
 | **Shelf** | Drop files onto the notch to keep them at hand; drag them back out. |
 | **Todo** | A short task list with times. |
@@ -48,44 +49,52 @@ line, or a running focus timer. Reminders peek out on their own.
 - **Stays out of the way.** It hides in full-screen games and videos. Over maximized windows (a
   browser full of tabs, say) it can stay, shrink to a thin line that lets clicks through to the tabs
   below, or hide.
+- **FPS overlay.** A small pinnable, draggable glass card with the on-screen FPS and load.
+- **Screenshots work.** Print Screen and Win+Shift+S capture the notch like any other window.
+
+## Settings
+
+Open **Settings** from the tray menu (the most used switches are in the tray menu itself). Its
+pages: **General** (the style, start with Windows, full screen and maximized windows, the look),
+**Prayer**, and in Nova mode also **Alerts & Privacy**, **Island** (which pages show, what the
+closed notch turns through), **Apps**, **Connections** (calendar, downloads), **Companion** and
+**Themes**.
+
+## Nova mode
+
+Nova turns on everything that follows [Nova Island](https://github.com/NOVA-TECH-KIT/nova-island),
+each part with its own switch. Classic Hilal stays exactly as it was, and Nova's own settings stay
+saved when you switch back.
+
+- **Prayer:** 44 cities around the world as well as Egypt's, or **wherever you are** (found from
+  your internet address), each with its country's method (Umm al-Qura, Dubai, Diyanet, ISNA and
+  more) and in the place's own time zone, like a mosque timetable. The Hijri date (adjustable by a
+  day or two for a local moon sighting), Asr by the Hanafi rule, a short heads-up 10 minutes
+  before, a Ramadan countdown to iftar and imsak, and the adhan as a card with the mascot.
 - **Dhikr, du'a and Qur'an.** Every few minutes (5 by default) a card with a verse, a dhikr or a
   du'a comes out of the notch for half a minute, in the King Fahd Complex's Qur'an script, sized
   to its words. Resting the mouse on it holds it; none repeats until all 136 have been shown. Pick
-  how often, for how long and which kinds, and set quiet hours. It waits while you focus, watch
-  something full screen or have the notch open.
-- **FPS overlay.** A small pinnable, draggable glass card with the on-screen FPS and load.
-- **Screenshots and recordings work.** Print Screen and Win+Shift+S capture the notch like any
-  other window. While OBS or Streamlabs runs, the notch turns solid so it shows in the recording,
-  and **Show in screen sharing** does the same for Discord and other screen shares.
-- **Ctrl+Alt+H** pins the notch open from anywhere, until you press it again.
-
-Everything is in **Settings** (open it from the tray menu), and most of it in the tray menu itself: start with Windows, Liquid Glass, showing in screen sharing,
-minimal notch, FPS overlay, the dhikr and Qur'an reminders (on or off, how often, for how long,
-which kinds, quiet hours, show one now), vertical mode and reset position, behavior over
-maximized windows and in full screen, the Hijri date adjustment, Asr by the Hanafi rule, and the
-adhan sound.
-
-**Classic or Nova.** Settings has a Style switch: **Classic Hilal** is Hilal as it was, and
-**Nova** turns on everything that follows [Nova Island](https://github.com/NOVA-TECH-KIT/nova-island).
-Nova's own settings stay saved either way. In Nova mode:
-
-- **Prayer:** other countries' methods, Auto location, the Hijri date, Ramadan (iftar and
-  imsak), Hanafi Asr, and the adhan as a scene with the mascot.
-- **The notch:** drag it anywhere, stand it on a side edge, or let it sit in Chrome, Edge or
-  Brave's address bar; a closed notch that turns between the clock and weather, CPU and memory,
-  the next prayer and the next meeting; a card for each new song; 13 themes; Ctrl+Alt+H pins it
-  open.
+  how often, for how long and which kinds, and set quiet hours.
+- **The notch:** **drag it** anywhere (dropped near the top edge it docks there, snapping to the
+  middle), stand it on the left or right edge as a slim capsule, or let it sit in the right third
+  of Chrome, Edge or Brave's address bar. Closed, it turns between the clock and weather, CPU and
+  memory, the next prayer and the next meeting. A card for each new song, 13 themes, and
+  **Ctrl+Alt+H** pins it open from anywhere until you press it again.
 - **Toasts:** volume, brightness, battery, keyboard language, Caps Lock, the internet, apps
-  using the mic or camera (with a dot on the notch), copied screenshots (saved and put on the
-  Shelf for a while), browser downloads, and a smart clipboard for links, colors and sums.
+  using the mic or camera (with a dot on the notch), copied screenshots (saved to
+  `Pictures\Hilal` and put on the Shelf for a while), browser downloads, and a smart clipboard
+  for links, colors and sums.
 - **Pages:** Apps (pinned apps to start or bring to the front), Quran Radio (live stations from
   mp3quran.net), and Clipboard (the connection, who's using the mic and camera, and what you
   copied, kept in memory only). Any page can be switched off.
 - **Meetings** from a private iCal link (Google, Outlook, iCloud): a toast before each, and Join.
-- **Companion:** Welcome back, a morning card, a break after 50 minutes, confetti, and eyes on
-  the notch.
-- **Dhikr, du'a and Qur'an** cards, a YouTube mini player, performance options (no animations,
-  frozen glass, battery saver), auto-update, and news from Hilal's GitHub page.
+- **Companion:** Welcome back (with what happened while you were away), a morning card, a break
+  after 50 minutes, confetti, and eyes on the notch that follow the mouse.
+- **Recordings and screen sharing:** while OBS or Streamlabs runs, the notch turns solid so it
+  shows in the recording, and **Show in screen sharing** does the same for Discord and others.
+- **And more:** a YouTube mini player, performance options (no animations, frozen glass, a
+  battery saver), **auto-update** (Hilal offers new versions itself), and news from Hilal's
+  GitHub page.
 
 ## Install
 
@@ -96,6 +105,9 @@ Nova's own settings stay saved either way. In Nova mode:
 
 Windows SmartScreen may warn that the installer is from an unknown publisher (it isn't code-signed):
 choose **More info**, then **Run anyway**. To build it yourself instead, see [Build](#build).
+
+To update, install the new version over the old one: your settings stay. In Nova mode Hilal
+checks for new versions itself and offers them on the notch.
 
 ### For the Video Download page
 
@@ -157,7 +169,7 @@ goes online only to fetch lyrics from [LRCLIB](https://lrclib.net) (the song's t
 length), for downloads you start yourself, and, only if you pick **Auto** as the prayer city, once
 a day to find your city from your internet address ([ipwho.is](https://ipwho.is), or if it's busy
 [GeoJS](https://www.geojs.io) or [ipapi](https://ipapi.co)). In Nova mode it also reads the weather
-from [Open-Meteo](https://open-meteo.com), Quran Radio's stations from
+from [Open-Meteo](https://open-meteo.com) (for the city found the same way), Quran Radio's stations from
 [mp3quran.net](https://mp3quran.net), your iCal link if you give one, and Hilal's own GitHub page
 (for updates and news); nothing is sent about you. The Claude Code page only reads the session
 files Claude Code keeps on your PC.
@@ -171,7 +183,8 @@ files Claude Code keeps on your PC.
   (`assets/fonts/KFGQPC-LICENSE.txt`).
 - The reminders' texts, the prayer methods by country and the way the notch moves and docks
   follow [Nova Island](https://github.com/NOVA-TECH-KIT/nova-island) by AmerTech, under the GPL v3.
-- Lyrics by [LRCLIB](https://lrclib.net).
+- Lyrics by [LRCLIB](https://lrclib.net), the weather by [Open-Meteo](https://open-meteo.com), and
+  Quran Radio's stations by [mp3quran.net](https://mp3quran.net).
 - Downloads by [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg](https://ffmpeg.org).
 - GPU readings through NVIDIA's NVML.
 - Inspired by [Nusa](https://rama2555.github.io/nusa/).

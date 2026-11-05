@@ -1318,6 +1318,9 @@ impl App {
         win::exclude_from_capture(self.hwnd, false);
         win::exclude_from_capture(self.overlay.hwnd, false);
         win::exclude_from_capture(self.popup.hwnd, false);
+        if !self.city_picker.hwnd.is_invalid() {
+            win::exclude_from_capture(self.city_picker.hwnd, false);
+        }
         // CAPTURE_HIDDEN tracks the "hidden" state; we're only visible for a moment.
         win::CAPTURE_HIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
         self.capture_until = Some(now + Duration::from_secs(6));
@@ -1602,6 +1605,9 @@ impl App {
                 win::exclude_from_capture(self.hwnd, true);
                 win::exclude_from_capture(self.overlay.hwnd, true);
                 win::exclude_from_capture(self.popup.hwnd, true);
+                if !self.city_picker.hwnd.is_invalid() {
+                    win::exclude_from_capture(self.city_picker.hwnd, true);
+                }
             }
         }
 
@@ -2048,6 +2054,9 @@ impl App {
         win::exclude_from_capture(self.hwnd, want);
         win::exclude_from_capture(self.overlay.hwnd, want);
         win::exclude_from_capture(self.popup.hwnd, want);
+        if !self.city_picker.hwnd.is_invalid() {
+            win::exclude_from_capture(self.city_picker.hwnd, want);
+        }
         self.backdrop_retry = Instant::now() - Duration::from_secs(10);
         self.closed_sig.clear();
         self.overlay.dirty = true;

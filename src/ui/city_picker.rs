@@ -74,9 +74,11 @@ impl App {
         let at = items.iter().position(|i| matches!(i, Item::City(c, _) if *c == cur)).unwrap_or(0);
         let max_top = items.len().saturating_sub(self.city_rows());
         self.city_picker.top = at.saturating_sub(3).min(max_top);
-        let x = self.origin.x + ((self.ox.get() + pill.x - 4.0) * k) as i32;
-        // (Just below the open notch, so the notch never covers its top.)
-        let y = self.origin.y + ((self.oy.get() + super::PAGE.h.max(pill.y + pill.h) + 6.0) * k) as i32;
+        // Under the pill: the page's own place in the window (its content starts at the open
+        // notch's left edge), just below the open notch so the notch never covers its top.
+        let page = self.shape_rect(super::PAGE);
+        let x = self.origin.x + ((page.x + pill.x - 4.0) * k) as i32;
+        let y = self.origin.y + ((page.y + super::PAGE.h.max(pill.y + pill.h) + 6.0) * k) as i32;
         let (w, h) = ((CP_W * k).round() as i32, (CP_H * k).round() as i32);
         let hwnd = self.city_picker.hwnd;
         unsafe {
@@ -87,7 +89,8 @@ impl App {
             Some(s) => self.gfx.move_surface(s, (x, y)),
         }
         // (Glass reads what's behind it, so it mustn't be in that picture itself.)
-        crate::win::exclude_from_capture(hwnd, self.glass_live);
+        // (Not while a screenshot is being taken: then it shows, with the notch.)
+        crate::win::exclude_from_capture(hwnd, self.glass_live && self.capture_until.is_none());
         self.city_picker.shown = true;
         self.city_picker.redraw_until = Some(Instant::now() + std::time::Duration::from_millis(600));
         self.draw_city_picker();

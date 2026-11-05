@@ -14,6 +14,7 @@ public static class QI {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern int GetWindowRgnBox(IntPtr h, out RECT r);
 }
 '@
 [QI]::SetProcessDPIAware() | Out-Null
@@ -54,6 +55,10 @@ Click ($cx - 210 + 44 + 50) 111     # the city pill
 $h = [QI]::FindWindow('HilalCities', 'Hilal Cities')
 "list open: " + ($h -ne [IntPtr]::Zero -and [QI]::IsWindowVisible($h))
 $r = New-Object QI+RECT; [QI]::GetWindowRect($h, [ref]$r) | Out-Null
+# Where it opened, against the open notch (its page starts 22 dp in, past the ear; the pill 44 dp into the page).
+$n = [QI]::FindWindow('HilalNotch', 'Hilal'); $nr = New-Object QI+RECT; [QI]::GetWindowRect($n, [ref]$nr) | Out-Null; $g = New-Object QI+RECT; [QI]::GetWindowRgnBox($n, [ref]$g) | Out-Null
+$pageL = $nr.L + $g.L + 2 + 22
+"open notch's page from x $pageL to $($nr.L + $g.R - 2 - 22), bottom y $($nr.T + $g.B); the list from x $($r.L) (that's $($r.L - $pageL) in; the pill is 44 in), top y $($r.T)"
 [QI]::SetCursorPos($r.L + 100, $r.T + 150) | Out-Null; Start-Sleep 1
 Shot $h 'list'
 for ($i = 0; $i -lt 15; $i++) { [QI]::mouse_event(0x800, 0, 0, 120, 0); Start-Sleep -Milliseconds 120 }

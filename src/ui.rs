@@ -643,6 +643,9 @@ pub struct App {
     /// Being dragged: where the anchor is held from the cursor (px).
     drag: Option<(i32, i32)>,
     lyric_pos: Cell<f32>,
+    /// The first line shown of plain (not synced) lyrics, and the song it's for.
+    plain_scroll: Cell<usize>,
+    plain_for: RefCell<Option<String>>,
     last_draw: Cell<Instant>,
     overlay: Overlay,
 }
@@ -940,6 +943,8 @@ impl App {
             saver_on: false,
             drag: None,
             lyric_pos: Cell::new(0.0),
+            plain_scroll: Cell::new(0),
+            plain_for: RefCell::new(None),
             last_draw: Cell::new(now),
         }
     }
@@ -1502,6 +1507,11 @@ impl App {
         }
 
         self.track = self.media.current();
+        let song = self.track.as_ref().map(|t| format!("{}|{}", t.title, t.artist));
+        if *self.plain_for.borrow() != song {
+            *self.plain_for.borrow_mut() = song;
+            self.plain_scroll.set(0);
+        }
         self.follow_track();
         self.sync_art();
         if let Some(t) = &self.track {
@@ -2369,6 +2379,14 @@ impl App {
             let max = self.clip_history.len() - 4;
             self.clip_scroll = if down { (self.clip_scroll + 1).min(max) } else { self.clip_scroll.saturating_sub(1) };
             return;
+        }
+        if self.page == Page::Music && self.lyrics_on && lx > 252.0 {
+            if let lyrics::State::Plain(lines) = &*self.lyrics.state.lock().unwrap() {
+                let max = lines.len().saturating_sub(5);
+                let s = self.plain_scroll.get();
+                self.plain_scroll.set(if down { (s + 1).min(max) } else { s.saturating_sub(1) });
+                return;
+            }
         }
         if self.page == Page::Radio && lx > 208.0 && y > 30.0 {
             self.radio_scroll_by(down);
@@ -3441,6 +3459,19 @@ impl App {
         self.player(&SPLIT);
         g.line(252.0, 22.0, 252.0, 118.0, 1.0, white(0.12));
         let center = 64.0;
+        // Only the words (no times): to read, scrolled with the wheel.
+        if let lyrics::State::Plain(lines) = &*self.lyrics.state.lock().unwrap() {
+            let top = self.plain_scroll.get().min(lines.len().saturating_sub(1));
+            g.clip(Rect::new(264.0, 8.0, 234.0, 128.0));
+            for (k, text) in lines.iter().skip(top).take(5).enumerate() {
+                let y = 30.0 + k as f32 * 21.0;
+                g.text(text, 264.0, y, 234.0, 13.0, 600, white(0.85), Align::Start);
+            }
+            g.unclip();
+            let more = if lines.len() > 5 { " \u{00b7} scroll for more" } else { "" };
+            g.text(&format!("Not synced{more}"), 264.0, 128.0, 234.0, 9.5, 500, white(0.4), Align::Start);
+            return;
+        }
         let Some((lines, cur)) = self.lyric_lines() else {
             let msg = match &*self.lyrics.state.lock().unwrap() {
                 lyrics::State::Missing => "Lyrics not available",

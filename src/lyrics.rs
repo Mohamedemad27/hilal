@@ -1,4 +1,5 @@
-//! Synced lyrics from LRCLIB (https://lrclib.net), a free community lyrics library.
+//! Lyrics from LRCLIB (https://lrclib.net), a free community lyrics library: synced ones (a
+//! time for each line) when it has them, else just the words.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,15 @@ pub enum State {
     Idle,
     Loading,
     Found(Vec<Line>),
+    /// Only the words, with no times: shown to read, not following the song.
+    Plain(Vec<String>),
     Missing,
+}
+
+/// What a lookup found.
+enum Got {
+    Synced(Vec<Line>),
+    Plain(Vec<String>),
 }
 
 /// Fetches lyrics in the background whenever the track changes.
@@ -41,14 +50,22 @@ impl Lyrics {
         std::thread::spawn(move || {
             let found = fetch(&title, &artist, duration_ms);
             *state.lock().unwrap() = match found {
-                Some(lines) if !lines.is_empty() => State::Found(lines),
+                Some(Got::Synced(lines)) if !lines.is_empty() => State::Found(lines),
+                Some(Got::Plain(lines)) if !lines.is_empty() => State::Plain(lines),
                 _ => State::Missing,
             };
         });
     }
 }
 
-fn fetch(title: &str, artist: &str, duration_ms: i64) -> Option<Vec<Line>> {
+/// The words of plain lyrics, line by line (blank lines between verses dropped).
+fn plain_lines(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+}
+
+fn fetch(title: &str, artist: &str, duration_ms: i64) -> Option<Got> {
+    // Synced lyrics if any entry has them; else the words of the closest one that has those.
+    let mut plain: Option<String> = None;
     let mut req = ureq::get("https://lrclib.net/api/get")
         .set("User-Agent", USER_AGENT)
         .query("track_name", title)
@@ -59,24 +76,37 @@ fn fetch(title: &str, artist: &str, duration_ms: i64) -> Option<Vec<Line>> {
     if let Ok(resp) = req.call() {
         if let Ok(v) = resp.into_json::<Value>() {
             if let Some(lrc) = v["syncedLyrics"].as_str() {
-                return Some(parse_lrc(lrc));
+                return Some(Got::Synced(parse_lrc(lrc)));
             }
+            plain = v["plainLyrics"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_owned);
         }
     }
     // The exact lookup is strict about duration and spelling; fall back to a search.
-    let results: Value = ureq::get("https://lrclib.net/api/search")
+    let results: Option<Value> = ureq::get("https://lrclib.net/api/search")
         .set("User-Agent", USER_AGENT)
         .query("track_name", title)
         .query("artist_name", artist)
         .call()
-        .ok()?
-        .into_json()
-        .ok()?;
-    let lrc = results
-        .as_array()?
-        .iter()
-        .find_map(|r| r["syncedLyrics"].as_str())?;
-    Some(parse_lrc(lrc))
+        .ok()
+        .and_then(|r| r.into_json().ok());
+    let list = results.as_ref().and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    if let Some(lrc) = list.iter().find_map(|r| r["syncedLyrics"].as_str()) {
+        return Some(Got::Synced(parse_lrc(lrc)));
+    }
+    if plain.is_none() {
+        // (The entry nearest the song's length: shorter ones are often previews.)
+        let secs = duration_ms as f64 / 1000.0;
+        plain = list
+            .iter()
+            .filter(|r| r["plainLyrics"].as_str().is_some_and(|t| !t.trim().is_empty()))
+            .min_by(|a, b| {
+                let d = |r: &Value| (r["duration"].as_f64().unwrap_or(0.0) - secs).abs();
+                d(a).total_cmp(&d(b))
+            })
+            .and_then(|r| r["plainLyrics"].as_str())
+            .map(str::to_owned);
+    }
+    plain.map(|t| Got::Plain(plain_lines(&t)))
 }
 
 /// Parses "[mm:ss.xx] text" lines. A line may carry several timestamps.
@@ -111,6 +141,25 @@ fn parse_stamp(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_lyrics_lose_their_blank_lines() {
+        assert_eq!(plain_lines("one\n\n  two  \r\nthree\n"), vec!["one", "two", "three"]);
+    }
+
+    /// A song LRCLIB has only the words of (run with --ignored: it asks LRCLIB).
+    #[test]
+    #[ignore]
+    fn falls_back_to_the_plain_words() {
+        match fetch("Seebk Enta", "Angham", 241_000) {
+            Some(Got::Plain(lines)) => {
+                println!("{} lines; first: {:?}", lines.len(), &lines[..3.min(lines.len())]);
+                assert!(lines.len() > 5);
+            }
+            Some(Got::Synced(_)) => println!("it has synced lyrics now"),
+            None => panic!("nothing found"),
+        }
+    }
 
     #[test]
     fn parses_lrc() {

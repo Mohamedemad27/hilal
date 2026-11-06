@@ -94,7 +94,8 @@ fn run(tx: Sender<Event>, on: Arc<AtomicBool>) {
             match unsafe { (a.GetMasterVolumeLevelScalar(), a.GetMute()) } {
                 (Ok(level), Ok(muted)) => {
                     let v = (level, muted.as_bool());
-                    if volume.is_some_and(|old| (old.0 - v.0).abs() > 0.004 || old.1 != v.1) {
+                    // (The first reading too: the music page's slider shows it.)
+                    if volume.is_none_or(|old| (old.0 - v.0).abs() > 0.004 || old.1 != v.1) {
                         let _ = tx.send(Event::Volume { level: v.0, muted: v.1 });
                     }
                     volume = Some(v);
@@ -324,6 +325,48 @@ fn endpoint_volume() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioEn
         let dev = e.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
         dev.Activate(CLSCTX_ALL, None).ok()
     }
+}
+
+thread_local! {
+    /// The speakers' volume control, kept for the slider and the wheel (looked up again
+    /// when the default device changes).
+    static SPEAKERS: std::cell::RefCell<Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` on the speakers' volume control (looking it up again once if it fails).
+fn with_speakers<T>(f: impl Fn(&windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume) -> windows::core::Result<T>) -> Option<T> {
+    SPEAKERS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_none() {
+            *s = endpoint_volume();
+        }
+        if let Some(r) = s.as_ref().and_then(|v| f(v).ok()) {
+            return Some(r);
+        }
+        *s = endpoint_volume();
+        s.as_ref().and_then(|v| f(v).ok())
+    })
+}
+
+/// Sets the speakers' volume (0 to 1); above nothing it also unmutes them.
+pub fn set_volume(level: f32) -> Option<f32> {
+    let level = level.clamp(0.0, 1.0);
+    with_speakers(|v| unsafe {
+        v.SetMasterVolumeLevelScalar(level, std::ptr::null())?;
+        if level > 0.0 {
+            v.SetMute(false, std::ptr::null())?;
+        }
+        Ok(level)
+    })
+}
+
+/// Mutes the speakers, or turns them back on. The new state, if it worked.
+pub fn toggle_speakers() -> Option<bool> {
+    with_speakers(|v| unsafe {
+        let muted = !v.GetMute()?.as_bool();
+        v.SetMute(muted, std::ptr::null())?;
+        Ok(muted)
+    })
 }
 
 /// The default microphone's volume control (its mute is the whole PC's mute for it).

@@ -28,6 +28,20 @@ const BUB_R: f32 = 12.5;
 const BUB_D: f32 = 16.0;
 const BUB_F: f32 = 8.0;
 
+/// The speaker glyph for a volume: crossed out when muted or silent, then one, two or
+/// three waves.
+pub fn volume_icon(level: f32, muted: bool) -> char {
+    if muted || level == 0.0 {
+        '\u{E74F}'
+    } else if level < 0.34 {
+        '\u{E993}'
+    } else if level < 0.67 {
+        '\u{E994}'
+    } else {
+        '\u{E995}'
+    }
+}
+
 /// A microphone drawn in lines (`k` about half its height), struck through when muted.
 fn mic_glyph(g: &crate::gfx::Gfx, x: f32, y: f32, k: f32, c: Color, muted: bool) {
     let w = (k * 0.24).max(1.2);
@@ -80,6 +94,8 @@ pub struct Watched {
     pub mic_muted: bool,
     /// The apps on the mic and camera have been read once.
     pub privacy_read: bool,
+    /// The speakers' volume (0 to 1) and whether they're muted, once read.
+    pub volume: Option<(f32, bool)>,
     pub link: Link,
     pub internet: Option<bool>,
     down_at: Option<Instant>,
@@ -104,6 +120,7 @@ impl Watched {
             cam: Vec::new(),
             mic_muted: false,
             privacy_read: false,
+            volume: None,
             link: Link::None,
             internet: None,
             down_at: None,
@@ -260,10 +277,10 @@ impl App {
                 }
             }
             Event::Volume { level, muted } => {
-                if vol && !self.open {
-                    let icon = if muted || level == 0.0 { '\u{E74F}' } else if level < 0.34 { '\u{E993}' } else if level < 0.67 { '\u{E994}' } else { '\u{E995}' };
-                    let value = if muted { "Muted".to_owned() } else { format!("{}%", (level * 100.0).round()) };
-                    self.toast(icon, WHITE, "", value, Some(if muted { 0.0 } else { level }), 1600);
+                // (Its first reading only fills in the slider.)
+                let before = self.watched.volume.replace((level, muted));
+                if vol && !self.open && before.is_some_and(|(l, m)| (l - level).abs() > 0.004 || m != muted) {
+                    self.volume_toast(level, muted);
                 }
             }
             Event::MicMute(muted) => {
@@ -713,6 +730,18 @@ impl App {
         .filter(|i| i.0)
         .map(|i| (i.1, i.2, i.3))
         .collect();
+        // The thin line (over a maximized window) is too thin for the badges: a dot each,
+        // inside it at its right end.
+        if !self.pos().vertical && s.h < 16.0 {
+            let r = (s.h / 2.0 - 0.8).clamp(1.0, 2.4);
+            let mut x = b.x + b.w - 10.0 - (icons.len() as f32 - 1.0) * 7.0;
+            for (_, c, is_mic) in &icons {
+                let c = if *is_mic && self.watched.mic_muted { MIC_OFF } else { *c };
+                g.fill_circle(x, s.h / 2.0, r, c);
+                x += 7.0;
+            }
+            return;
+        }
         let step = PRIVACY_STEP;
         let back = (icons.len() as f32 - 1.0) * step;
         // At the right end: of the closed notch and toasts (in line with what they show, which
@@ -754,6 +783,38 @@ impl App {
                 self.oy.set(oy);
             }
             x += step;
+        }
+    }
+
+    /// The volume's toast (on the closed notch): its icon, the level, a bar.
+    fn volume_toast(&mut self, level: f32, muted: bool) {
+        let value = if muted { "Muted".to_owned() } else { format!("{}%", (level * 100.0).round()) };
+        self.toast(volume_icon(level, muted), WHITE, "", value, Some(if muted { 0.0 } else { level }), 1600);
+    }
+
+    /// Sets the speakers' volume from Hilal (the slider, the wheel): shown at once, on the
+    /// slider or (closed) in the volume's toast.
+    pub(super) fn volume_to(&mut self, level: f32) {
+        let muted = self.watched.volume.is_some_and(|v| v.1);
+        let Some(level) = watch::set_volume(level) else { return };
+        let muted = muted && level == 0.0;
+        self.watched.volume = Some((level, muted));
+        if !self.open && self.store.features.hud_volume {
+            self.volume_toast(level, muted);
+        }
+    }
+
+    /// The wheel's notches on the volume: 2% each (as Windows' own steps).
+    pub(super) fn volume_step(&mut self, notches: i32) {
+        let level = self.watched.volume.map_or(0.5, |v| v.0);
+        self.volume_to(((level * 50.0).round() + notches as f32) / 50.0);
+    }
+
+    /// Mutes the speakers, or turns them back on.
+    pub(super) fn speakers_toggle(&mut self) {
+        if let Some(muted) = watch::toggle_speakers() {
+            let level = self.watched.volume.map_or(0.5, |v| v.0);
+            self.watched.volume = Some((level, muted));
         }
     }
 

@@ -295,6 +295,11 @@ enum Action {
     ClipCopy(usize),
     /// Mutes or unmutes the microphone (the mic icon on the notch).
     MicToggle,
+    /// Sets the speakers' volume where the slider was pressed (its left x in the window, its
+    /// width); dragged, it follows.
+    VolumeBar(f32, f32),
+    /// Mutes or unmutes the speakers (the speaker beside the slider).
+    SpeakerMute,
     /// The Apps page: open a pinned app, take one off, edit, add.
     AppOpen(usize),
     AppRemove(usize),
@@ -2386,6 +2391,15 @@ impl App {
     }
 
     pub fn mouse_move(&mut self, x: f32, y: f32) {
+        // Dragging the volume slider: the volume follows (in 1% steps).
+        if let Some((Action::VolumeBar(x0, bw), _, _)) = self.pressed {
+            let level = ((x - x0) / bw).clamp(0.0, 1.0);
+            if self.watched.volume.is_none_or(|v| (v.0 - level).abs() >= 0.01) {
+                self.volume_to(level);
+                self.draw();
+            }
+            return;
+        }
         let Some((Action::ShelfOpen(i), px, py)) = self.pressed else { return };
         if (x - px).hypot(y - py) < 6.0 {
             return;
@@ -2412,7 +2426,18 @@ impl App {
     }
 
     pub fn wheel(&mut self, delta: i32) {
-        if self.form.is_some() || !self.open {
+        if self.form.is_some() {
+            return;
+        }
+        // The wheel on the volume: over the closed notch, over the music page's slider, or
+        // anywhere on the notch with Ctrl held.
+        let ctrl = unsafe { GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) } < 0;
+        let page = self.shape_rect(PAGE);
+        let over_slider = self.page == Page::Music && !self.lyrics_on && self.cursor.0 - page.x > 286.0 && self.cursor.1 - page.y > 102.0;
+        if !self.open || ctrl || over_slider {
+            let notches = if delta > 0 { (delta / 120).max(1) } else { (delta / 120).min(-1) };
+            self.volume_step(notches);
+            self.draw();
             return;
         }
         let (x, y) = self.cursor;
@@ -2640,6 +2665,14 @@ impl App {
                 self.mic_toggle();
                 save = false;
             }
+            VolumeBar(x0, bw) => {
+                self.volume_to((x - x0) / bw);
+                save = false;
+            }
+            SpeakerMute => {
+                self.speakers_toggle();
+                save = false;
+            }
             AppOpen(i) => {
                 if let Some(a) = self.pinned_apps().get(i) {
                     crate::apps::open(&a.id);
@@ -2835,7 +2868,7 @@ impl App {
 
     fn hit(&self, r: Rect, a: Action) {
         // Small buttons without their own feedback get a soft highlight while pressed.
-        let own = matches!(a, Action::Previous | Action::PlayPause | Action::Next | Action::PagePrev | Action::PageNext | Action::SeekBar(..) | Action::Page(_) | Action::ShelfOpen(_));
+        let own = matches!(a, Action::Previous | Action::PlayPause | Action::Next | Action::PagePrev | Action::PageNext | Action::SeekBar(..) | Action::VolumeBar(..) | Action::Page(_) | Action::ShelfOpen(_));
         if !own && r.w <= 140.0 && r.h <= 60.0 {
             let k = self.press_k(a);
             if k > 0.0 {
@@ -3658,6 +3691,26 @@ impl App {
         self.hit(Rect::centered(l.prev, cy, 28.0, 24.0), Action::Previous);
         self.hit(Rect::centered(l.play, cy, 28.0, 24.0), Action::PlayPause);
         self.hit(Rect::centered(l.next, cy, 28.0, 24.0), Action::Next);
+
+        // The volume, at the row's right end (not beside the lyrics): the speaker mutes, the
+        // slider sets it (clicked, dragged, or under the wheel). It thickens under the mouse.
+        if std::ptr::eq(l, &NORMAL) {
+            if let Some((level, muted)) = self.watched.volume {
+                let ir = Rect::centered(302.0, cy, 20.0, 20.0);
+                g.icon(toasts::volume_icon(level, muted), 302.0, cy + 0.5, 12.0, white(if self.hovered(ir) { 1.0 } else { 0.75 }));
+                self.hit(ir, Action::SpeakerMute);
+                let zone = Rect::new(314.0, cy - 10.0, 72.0, 20.0);
+                let hot = self.hovered(zone) || matches!(self.pressed, Some((Action::VolumeBar(..), _, _)));
+                let h = if hot { 6.0 } else { 4.0 };
+                let bar = Rect::new(318.0, cy - h / 2.0, 60.0, h);
+                g.fill_rrect(bar, h / 2.0, white(0.22));
+                let shown = if muted { 0.0 } else { level };
+                if shown > 0.0 {
+                    g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * shown).max(h), h), h / 2.0, WHITE);
+                }
+                self.hit(zone, Action::VolumeBar(self.ox.get() + bar.x, bar.w));
+            }
+        }
     }
 
     // ----- pomodoro ---------------------------------------------------------------------

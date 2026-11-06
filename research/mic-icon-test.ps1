@@ -1,7 +1,8 @@
 # The mic icon on the notch (an app using the mic, as Discord in a call), with HILAL_MIC_DRY:
 # clicks only flip a pretend mute (the real microphone is never touched). Pictures of the
 # closed notch and the open page, before and after a click on the icon. Settings put back.
-param([string]$Exe = 'K:\hilal\target\release\hilal.exe')
+# -Minimal: the thin line instead (as over a maximized window), pictures only.
+param([string]$Exe = 'K:\hilal\target\release\hilal.exe', [switch]$Minimal)
 Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public static class QK {
@@ -23,6 +24,7 @@ $j.settings | Add-Member -Force vertical $false
 $j.settings | Add-Member -Force anchor $null
 $j.settings | Add-Member -Force docked $true
 $j.settings | Add-Member -Force shrink_over_maximized $false
+$j.settings | Add-Member -Force minimal ([bool]$Minimal)
 $j | Add-Member -Force brief_day ([int](Get-Date -Format 'yyyyMMdd'))
 $j.water | Add-Member -Force enabled $false
 $j.prayer | Add-Member -Force alerts $false

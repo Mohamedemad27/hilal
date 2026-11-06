@@ -14,6 +14,7 @@ mod download;
 mod news;
 mod prayer;
 mod radio;
+mod radio_art;
 mod reminders_data;
 mod shell;
 mod sound;
@@ -194,6 +195,10 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn main() -> Result<()> {
+    // Hilal playing Quran Radio for itself (see radio::run_apart): no notch, no single-instance.
+    if std::env::args().nth(1).as_deref() == Some("--radio-player") {
+        return radio::run_apart();
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         // One Hilal at a time: a second launch just leaves.

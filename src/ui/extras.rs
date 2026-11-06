@@ -82,17 +82,16 @@ impl App {
         if self.radio.want {
             self.radio.stop();
         } else if let Some((_, s)) = self.radio_station() {
-            let url = s.url.clone();
-            self.radio.play(&url);
+            let s = s.clone();
+            self.radio.play(&s);
         }
     }
 
     pub(super) fn radio_pick(&mut self, i: usize) {
-        if let Some(s) = self.store.radio_stations.get(i) {
-            let url = s.url.clone();
-            self.store.radio_station = Some(url.clone());
+        if let Some(s) = self.store.radio_stations.get(i).cloned() {
+            self.store.radio_station = Some(s.url.clone());
             self.store.save();
-            self.radio.play(&url);
+            self.radio.play(&s);
         }
     }
 
